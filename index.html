@@ -2968,6 +2968,16 @@ function App() {
   const [loginPinInput, setLoginPinInput] = useState("");
   const [loginPinConfirm, setLoginPinConfirm] = useState("");
   const [loginError, setLoginError] = useState("");
+
+  // The cross-hotel Admin dashboard (in the outer cloud toolbar, separate
+  // from this React app) must never be reachable from a plain Operator PIN
+  // session — only once the in-app Manager PIN has actually been entered.
+  // That toolbar is rendered outside React, so tell it about mode changes
+  // explicitly rather than relying on it to read React state.
+  useEffect(function () {
+    if (window.notifyAppMode) window.notifyAppMode(appAuthed ? userMode : "locked");
+  }, [appAuthed, userMode]);
+
   const resetLoginFlow = function () {
     setLoginRole(null);
     setLoginStep("choose");
@@ -24966,15 +24976,32 @@ function renderAuthForm() {
   render();
 }
 
+// Mirrors the React app's in-app role ("operator" | "manager" | "locked" while
+// on the PIN screen). The cross-hotel Admin button must only ever be offered
+// when this is "manager" — never for a plain Operator PIN session, even on
+// the hotel owner's own device/account.
+let appModeForToolbar = "locked";
+let toolbarIsAdmin = false;
+let toolbarView = "kitchen";
+
+function shouldShowAdminBtn() {
+  if (!toolbarIsAdmin) return false;
+  if (toolbarView === "admin") return true; // already in the cross-hotel view — keep the way back visible
+  return appModeForToolbar === "manager";
+}
+
 function renderToolbar(isAdmin, view) {
+  toolbarIsAdmin = isAdmin;
+  toolbarView = view;
   const bar = document.getElementById('cloudToolbar');
   bar.style.display = 'flex';
+  const showAdminBtn = shouldShowAdminBtn();
   bar.innerHTML = `
     <span class="ct-status" id="ctStatus"><span class="ct-dot"></span>Synced</span>
-    ${isAdmin ? `<button id="ctAdminBtn" class="${view === 'admin' ? 'ct-admin' : ''}">${view === 'admin' ? '🍳 My Kitchen' : '📊 Admin'}</button>` : ''}
+    ${showAdminBtn ? `<button id="ctAdminBtn" class="${view === 'admin' ? 'ct-admin' : ''}">${view === 'admin' ? '🍳 My Kitchen' : '📊 Admin'}</button>` : ''}
     <button id="ctLogoutBtn">Sign out</button>
   `;
-  if (isAdmin) {
+  if (showAdminBtn) {
     document.getElementById('ctAdminBtn').addEventListener('click', () => {
       if (view === 'admin') showKitchenApp(); else showAdminView();
     });
@@ -24986,6 +25013,12 @@ function renderToolbar(isAdmin, view) {
     location.reload();
   });
 }
+
+// Called by the React app whenever its in-app operator/manager mode changes.
+window.notifyAppMode = function (mode) {
+  appModeForToolbar = mode;
+  if (toolbarView === "kitchen") renderToolbar(toolbarIsAdmin, toolbarView);
+};
 
 function setSyncStatus(ok) {
   const el = document.getElementById('ctStatus');
