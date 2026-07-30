@@ -7,6 +7,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
 :root{
@@ -317,6 +319,32 @@ function lsLoad(key, fallback) {
 var _lsTimers = {};
 var _lsPending = {};
 var _CRITICAL_KEYS = ['orders', 'cashLog', 'drawer', 'expenseLog'];
+// ── Cloud-sync race protection ────────────────────────────────────────
+// Not prefixed with LS_KEY/LS_PREFIX so it's never touched by the cloud
+// snapshot delete/restore cycle in applySnapshotToLocalStorage.
+// Tracks the last time ANY local data was written, and the last time that
+// data was successfully pushed to the cloud, so pullSnapshot() can tell
+// whether local has changes the cloud doesn't know about yet (e.g. a
+// refresh happened before the beforeunload push finished) and avoid
+// clobbering them with a stale cloud copy.
+var SYNC_META_LOCAL_WRITE_KEY = 'kk_sync_meta_lastLocalWrite';
+function markLocalWrite() {
+  try { localStorage.setItem(SYNC_META_LOCAL_WRITE_KEY, new Date().toISOString()); } catch (e) {}
+}
+// Debounced near-real-time cloud push, separate from the 30s auto-sync
+// interval, so edits reach the cloud within a couple seconds instead of
+// only on the next interval tick / tab-hide / unload.
+var _cloudSyncTimer = null;
+function scheduleCloudSync() {
+  if (_cloudSyncTimer) clearTimeout(_cloudSyncTimer);
+  _cloudSyncTimer = setTimeout(function () {
+    _cloudSyncTimer = null;
+    if (window.pushSnapshot && window.getCurrentUid) {
+      var uid = window.getCurrentUid();
+      if (uid) window.pushSnapshot(uid);
+    }
+  }, 2000);
+}
 function lsSave(key, val) {
   if (_lsTimers[key]) clearTimeout(_lsTimers[key]);
   _lsPending[key] = val;
@@ -326,6 +354,8 @@ function lsSave(key, val) {
     delete _lsPending[key];
     try {
       localStorage.setItem(LS_KEY + '_' + key, JSON.stringify(val));
+      markLocalWrite();
+      scheduleCloudSync();
     } catch (e) {
       if (e.name === 'QuotaExceededError') {
         console.error('[Storage Error] LocalStorage quota exceeded. App will continue but data may not persist.');
@@ -348,6 +378,7 @@ function lsFlush() {
     if (Object.prototype.hasOwnProperty.call(_lsPending, key)) {
       try {
         localStorage.setItem(LS_KEY + '_' + key, JSON.stringify(_lsPending[key]));
+        markLocalWrite();
       } catch (e) {}
       delete _lsPending[key];
     }
@@ -500,7 +531,7 @@ async function lsClear() {
   logTransaction('SYSTEM', 'HARD_RESET', { reason: 'User initiated hard reset' });
   
   try {
-    ['orders', 'expenseLog', 'cashLog', 'drawer', 'inv', 'adjustments', 'menuItems', 'kitchenName', 'lastSyncTime', 'currentDate', 'dayOpen', 'dayClosedAt', 'suppliers', 'capitalInjections', 'ownerLoans', 'financiers', 'kitchenLog', 'ingCostOverrides', 'closingStock', 'purchaseOrders', 'requisitions'].forEach(function (k) {
+    ['orders', 'expenseLog', 'cashLog', 'drawer', 'inv', 'adjustments', 'menuItems', 'menuStockLevels', 'menuStockAdjustments', 'stockAdjustments', 'kitchenName', 'lastSyncTime', 'currentDate', 'dayOpen', 'dayClosedAt', 'suppliers', 'capitalInjections', 'ownerLoans', 'financiers', 'kitchenLog', 'ingCostOverrides', 'closingStock', 'purchaseOrders', 'requisitions', 'employees', 'payrollPayments', 'labourOverheadPct', 'utilitiesOverheadPct', 'transactionLog'].forEach(function (k) {
       localStorage.removeItem(LS_KEY + '_' + k);
     });
     console.log('[Clear] All data cleared locally');
@@ -533,7 +564,7 @@ async function lsClear() {
     return false;
   }
 }
-const C = {
+const DARK_PALETTE = {
   bg: "#0F0A06",
   surf: "#1B140C",
   surf2: "#241B10",
@@ -553,8 +584,41 @@ const C = {
   divider: "#4A301855",
   shadowSm: "0 1px 2px rgba(0,0,0,0.35)",
   shadowMd: "0 4px 14px rgba(0,0,0,0.35)",
-  shadowLg: "0 12px 32px rgba(0,0,0,0.45)"
+  shadowLg: "0 12px 32px rgba(0,0,0,0.45)",
+  colorScheme: "dark"
 };
+const LIGHT_PALETTE = {
+  bg: "#FAF6EF",
+  surf: "#FFFFFF",
+  surf2: "#F3ECE0",
+  card: "#FFFFFF",
+  cardHover: "#F5EEE2",
+  accent: "#D9702F",
+  accentSoft: "#E8834A1A",
+  gold: "#9C7522",
+  green: "#1F8A5C",
+  red: "#C93E3E",
+  blue: "#2472B8",
+  purple: "#7C5CD6",
+  text: "#2A1E10",
+  muted: "#6B5A45",
+  border: "#E4D8C4",
+  divider: "#E4D8C4AA",
+  shadowSm: "0 1px 2px rgba(30,20,10,0.08)",
+  shadowMd: "0 4px 14px rgba(30,20,10,0.10)",
+  shadowLg: "0 12px 32px rgba(30,20,10,0.14)",
+  colorScheme: "light"
+};
+const C = Object.assign({}, DARK_PALETTE);
+const ORDER_TYPES = {
+  "dine-in": { label: "Dine-In", icon: "🍽️", short: "DI", color: C.green },
+  "delivery": { label: "Delivery", icon: "🛵", short: "DEL", color: C.blue },
+  "takeaway": { label: "Takeaway", icon: "📦", short: "TA", color: C.gold },
+  "mixed": { label: "Mixed", icon: "🔀", short: "MIX", color: C.purple }
+};
+function otMeta(t) {
+  return ORDER_TYPES[t] || ORDER_TYPES["dine-in"];
+}
 const MENU = [{
   id: 1,
   name: "Beans",
@@ -1437,7 +1501,7 @@ const RECIPES = {
   // Minji Rice
   20: [{
     invId: 14,
-    qty: 0.25
+    qty: 0.167
   }, {
     invId: 27,
     qty: 0.005
@@ -1774,8 +1838,8 @@ const MAIN_INGREDIENT = {
   // Minji Chapo (2) → Kasukus (Green Peas)
   19: 6,
   // Minji Rice → Kasukus (Green Peas)
-  20: 27,
-  // Mixed Tea → Tea Leaves
+  20: 14,
+  // Mixed Tea → Milk
   21: 4,
   // Mukimo → Potatoes (Waru)
   22: 18,
@@ -2356,7 +2420,7 @@ function SvgBarChart(props) {
     pt = 8,
     pb = 28;
   const maxV = Math.max.apply(null, data.map(function (d) {
-    return d.inH + d.del;
+    return d.inH + d.del + (d.tk || 0);
   }));
   const cW = (W - pl - pr) / data.length;
   const bW = Math.min(cW * 0.6, 16);
@@ -2399,8 +2463,10 @@ function SvgBarChart(props) {
     }, Math.round(maxV * f / 1000) + "k"));
   }), data.map(function (d, i) {
     const x = pl + i * cW + (cW - bW) / 2;
-    const yInH = sy(d.inH + d.del);
-    const yDel = sy(d.del);
+    const tk = d.tk || 0;
+    const yInH = sy(d.inH + d.del + tk);
+    const yDel = sy(d.del + tk);
+    const yTk = sy(tk);
     return React.createElement("g", {
       key: i,
       onMouseEnter: function () {
@@ -2427,7 +2493,13 @@ function SvgBarChart(props) {
       y: yDel,
       width: bW,
       height: bh(d.del),
-      fill: C.blue,
+      fill: C.blue
+    }), tk > 0 && React.createElement("rect", {
+      x: x,
+      y: yTk,
+      width: bW,
+      height: bh(tk),
+      fill: C.gold,
       rx: 2
     }), React.createElement("text", {
       x: x + bW / 2,
@@ -2438,33 +2510,39 @@ function SvgBarChart(props) {
     }, d.date));
   }), tip && React.createElement("g", null, React.createElement("rect", {
     x: tip.x - 40,
-    y: tip.y - 48,
+    y: tip.y - 60,
     width: 80,
-    height: 46,
+    height: tip.d.tk ? 58 : 46,
     fill: C.card,
     rx: 4,
     stroke: C.border,
     strokeWidth: 1
   }), React.createElement("text", {
     x: tip.x,
-    y: tip.y - 34,
+    y: tip.y - 46,
     textAnchor: "middle",
     fill: C.text,
     fontSize: 8,
     fontWeight: "bold"
   }, tip.d.date), React.createElement("text", {
     x: tip.x,
-    y: tip.y - 22,
+    y: tip.y - 34,
     textAnchor: "middle",
     fill: C.green,
     fontSize: 7
   }, "Dine-In: " + fmtK(tip.d.inH)), React.createElement("text", {
     x: tip.x,
-    y: tip.y - 11,
+    y: tip.y - 23,
     textAnchor: "middle",
     fill: C.blue,
     fontSize: 7
-  }, "Delivery: " + fmtK(tip.d.del)))), React.createElement("div", {
+  }, "Delivery: " + fmtK(tip.d.del)), tip.d.tk ? React.createElement("text", {
+    x: tip.x,
+    y: tip.y - 12,
+    textAnchor: "middle",
+    fill: C.gold,
+    fontSize: 7
+  }, "Takeaway: " + fmtK(tip.d.tk)) : null)), React.createElement("div", {
     style: {
       display: "flex",
       gap: 14,
@@ -2481,7 +2559,11 @@ function SvgBarChart(props) {
     style: {
       color: C.blue
     }
-  }, "■"), " Delivery")));
+  }, "■"), " Delivery"), React.createElement("span", null, React.createElement("span", {
+    style: {
+      color: C.gold
+    }
+  }, "■"), " Takeaway")));
 }
 
 // SVG Pie Chart
@@ -2813,6 +2895,48 @@ function App() {
   const [currentDate, setCurrentDate] = useState(function () {
     return lsLoad("currentDate", new Date().toISOString().split("T")[0]);
   });
+
+  // ── Theme (dark / light) ────────────────────────────────────────────
+  const [theme, setTheme] = useState(function () {
+    return lsLoad("theme", "dark");
+  });
+  useEffect(function () {
+    lsSave("theme", theme);
+  }, [theme]);
+  // Mutate the shared C object in place (rather than reassigning it) so every
+  // module-level helper/component that reads C.xxx picks up the new colors
+  // as soon as this component re-renders — no prop drilling needed.
+  Object.assign(C, theme === "light" ? LIGHT_PALETTE : DARK_PALETTE);
+  useEffect(function () {
+    document.documentElement.style.colorScheme = C.colorScheme;
+    document.body.style.background = C.bg;
+    document.body.style.color = C.text;
+  }, [theme]);
+  const toggleTheme = function () {
+    setTheme(function (t) { return t === "dark" ? "light" : "dark"; });
+  };
+
+  // ── Fullscreen ───────────────────────────────────────────────────────
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(function () {
+    const handler = function () {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", handler);
+    return function () {
+      document.removeEventListener("fullscreenchange", handler);
+    };
+  }, []);
+  const toggleFullscreen = function () {
+    if (!document.fullscreenElement) {
+      const el = document.documentElement;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+      if (req) req.call(el).catch(function () {});
+    } else {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+      if (exit) exit.call(document).catch(function () {});
+    }
+  };
 
   // ── Day open/close security ───────────────────────────────────────
   const [dayOpen, setDayOpen] = useState(function () {
@@ -4241,6 +4365,7 @@ function App() {
   const [cart, setCart] = useState([]);
   const [orderType, setOrderType] = useState("dine-in");
   const [custNote, setCustNote] = useState("");
+  const [orderDiscount, setOrderDiscount] = useState(0);
   const [showPay, setShowPay] = useState(false);
   const [payMethod, setPayMethod] = useState("cash");
   const [cashReceived, setCashReceived] = useState("");
@@ -4317,7 +4442,9 @@ function App() {
   const [newInvError, setNewInvError] = useState("");
   const [stockAdjustId, setStockAdjustId] = useState(null);
   const [stockAdjustQty, setStockAdjustQty] = useState("");
+  const [stockAdjustCost, setStockAdjustCost] = useState("");
   const [stockAdjustReason, setStockAdjustReason] = useState("");
+  const [stockAdjustPin, setStockAdjustPin] = useState("");
   const [stockAdjustError, setStockAdjustError] = useState("");
 
   const addInvItem = function () {
@@ -4355,27 +4482,38 @@ function App() {
   const openStockAdjust = function (item) {
     setStockAdjustId(item.id);
     setStockAdjustQty(String(item.stock));
+    setStockAdjustCost(String(item.costPer != null ? item.costPer : ""));
     setStockAdjustReason("");
+    setStockAdjustPin("");
     setStockAdjustError("");
   };
   const closeStockAdjust = function () {
-    setStockAdjustId(null); setStockAdjustQty(""); setStockAdjustReason(""); setStockAdjustError("");
+    setStockAdjustId(null); setStockAdjustQty(""); setStockAdjustCost(""); setStockAdjustReason("");
+    setStockAdjustPin(""); setStockAdjustError("");
   };
-  const confirmStockAdjust = function () {
+  const confirmStockAdjust = async function () {
     const item = inv.find(function (i) { return i.id === stockAdjustId; });
     if (!item) { closeStockAdjust(); return; }
     const val = parseFloat(stockAdjustQty);
     if (isNaN(val) || val < 0) { setStockAdjustError("Enter a valid quantity (0 or more)."); return; }
+    const costVal = stockAdjustCost.trim() === "" ? item.costPer : parseFloat(stockAdjustCost);
+    if (isNaN(costVal) || costVal < 0) { setStockAdjustError("Enter a valid cost per " + item.unit + " (0 or more)."); return; }
     if (!stockAdjustReason.trim()) { setStockAdjustError("Enter a reason for this adjustment (e.g. stocktake, spoilage, correction)."); return; }
+    if (!managerPin) { setStockAdjustError("Set a manager PIN first (Cash Reg \u2192 day close sets one up)."); return; }
+    const ok = await pinMatches(stockAdjustPin, managerPin);
+    if (!ok) { setStockAdjustError("Incorrect PIN"); return; }
     const newStock = Math.round(val * 1000) / 1000;
     const delta = Math.round((newStock - item.stock) * 1000) / 1000;
+    const newCost = Math.round(costVal * 100) / 100;
+    const costChanged = newCost !== item.costPer;
     setInv(function (prev) {
-      return prev.map(function (i) { return i.id === item.id ? Object.assign({}, i, { stock: newStock }) : i; });
+      return prev.map(function (i) { return i.id === item.id ? Object.assign({}, i, { stock: newStock, costPer: newCost }) : i; });
     });
     setStockAdjustments(function (prev) {
       return prev.concat([{
         id: Date.now(), invId: item.id, name: item.name, unit: item.unit,
         prevStock: item.stock, newStock: newStock, delta: delta,
+        prevCost: item.costPer, newCost: newCost, costChanged: costChanged,
         reason: stockAdjustReason.trim(), at: new Date().toISOString()
       }]);
     });
@@ -4394,6 +4532,10 @@ function App() {
   const [catF, setCatF] = useState("All");
   const [srch, setSrch] = useState("");
   const [repTab, setRepTab] = useState("daily");
+  const [opReportTab, setOpReportTab] = useState("sales"); // "sales" | "inventory" — operator Reports tab sub-view
+  const [opReportDate, setOpReportDate] = useState(function () {
+    return lsLoad("currentDate", new Date().toISOString().split("T")[0]);
+  }); // selected day for the operator Reports view — defaults to today, can be changed to pull a past day's report
   const [regTab, setRegTab] = useState("summary"); // register sub-tabs
   // ── Sales-by-date filter range (defaults to current month) ──────────
   const [sdFrom, setSdFrom] = useState(function () {
@@ -4469,6 +4611,27 @@ function App() {
       })]);
     });
   };
+  const switchOrderType = function (t) {
+    setOrderType(t);
+    setCart(function (c) {
+      const merged = [];
+      c.forEach(function (x) {
+        const newKey = x.id + "_" + t;
+        const existing = merged.find(function (m) {
+          return m.cartKey === newKey;
+        });
+        if (existing) {
+          existing.qty += x.qty;
+        } else {
+          merged.push(Object.assign({}, x, {
+            cartKey: newKey,
+            lineType: t
+          }));
+        }
+      });
+      return merged;
+    });
+  };
   const changeQty = function (cartKey, d) {
     setCart(function (c) {
       return c.map(function (x) {
@@ -4483,6 +4646,8 @@ function App() {
   const total = cart.reduce(function (s, x) {
     return s + x.price * x.qty;
   }, 0);
+  const discountAmount = Math.max(0, Math.min(orderDiscount, total));
+  const finalTotal = Math.max(0, total - discountAmount);
   const itemCount = cart.reduce(function (s, x) {
     return s + x.qty;
   }, 0);
@@ -4494,7 +4659,11 @@ function App() {
   const cartHasDelivery = cart.some(function (x) {
     return x.lineType === "delivery";
   });
-  const effectiveOrderType = cartHasDineIn && cartHasDelivery ? "mixed" : cartHasDelivery ? "delivery" : "dine-in";
+  const cartHasTakeaway = cart.some(function (x) {
+    return x.lineType === "takeaway";
+  });
+  const distinctLineTypes = [cartHasDineIn, cartHasDelivery, cartHasTakeaway].filter(Boolean).length;
+  const effectiveOrderType = distinctLineTypes > 1 ? "mixed" : cartHasDelivery ? "delivery" : cartHasTakeaway ? "takeaway" : "dine-in";
   const checkoutInProgressRef = useRef(false);
   const checkout = function () {
     // Guard against a fast double-click/double-tap submitting the same order twice
@@ -4507,7 +4676,9 @@ function App() {
       id: tsNow,
       no: orders.length + 1,
       items: cart.slice(),
-      total: total,
+      total: finalTotal,
+      subtotal: total,
+      discount: discountAmount,
       itemCount: itemCount,
       type: effectiveOrderType,
       note: custNote,
@@ -4550,14 +4721,14 @@ function App() {
     });
     if (payMethod === "cash") {
       setDrawer(function (d) {
-        return d + total;
+        return d + finalTotal;
       });
       setCashLog(function (l) {
         return l.concat([{
           id: tsNow + 1,
           type: "Sale",
           method: "cash",
-          amt: total,
+          amt: finalTotal,
           note: "Order #" + o.no + " (" + orderType + ")",
           time: o.time,
           dir: "in",
@@ -4570,7 +4741,7 @@ function App() {
           id: tsNow + 1,
           type: "M-Pesa Sale",
           method: "mpesa",
-          amt: total,
+          amt: finalTotal,
           note: "Order #" + o.no + " (" + orderType + ")",
           time: o.time,
           dir: "mpesa",
@@ -4594,6 +4765,7 @@ function App() {
     // tab: revenue is recorded but no cash movement yet
     setCart([]);
     setCustNote("");
+    setOrderDiscount(0);
     setCashReceived("");
     setShowPay(false);
     setReceipt(o);
@@ -4907,7 +5079,7 @@ function App() {
     return todayOrders.reduce(function (s, o) {
       if (o.type === "dine-in") return s + o.total;
       if (o.type === "mixed" && o.items) return s + o.items.filter(function (i) {
-        return i.lineType !== "delivery";
+        return i.lineType !== "delivery" && i.lineType !== "takeaway";
       }).reduce(function (a, i) {
         return a + i.price * i.qty;
       }, 0);
@@ -4925,13 +5097,24 @@ function App() {
       return s;
     }, 0);
   }, [todayOrders]);
+  const todayTakeaway = useMemo(function () {
+    return todayOrders.reduce(function (s, o) {
+      if (o.type === "takeaway") return s + o.total;
+      if (o.type === "mixed" && o.items) return s + o.items.filter(function (i) {
+        return i.lineType === "takeaway";
+      }).reduce(function (a, i) {
+        return a + i.price * i.qty;
+      }, 0);
+      return s;
+    }, 0);
+  }, [todayOrders]);
   const todayTot = useMemo(function () {
     return todayOrders.reduce(function (s, o) {
       return s + o.total;
     }, 0);
   }, [todayOrders]);
 
-  // ── MAR_DATA: current-month daily revenue breakdown (Dine-In vs Delivery) ──
+  // ── MAR_DATA: current-month daily revenue breakdown (Dine-In vs Delivery vs Takeaway) ──
   const MAR_DATA = useMemo(function () {
     var ym = currentDate.slice(0, 7); // "YYYY-MM"
     var dayMap = {};
@@ -4939,15 +5122,19 @@ function App() {
       if (o.voided) return;
       var d = o.date || currentDate;
       if (!d.startsWith(ym)) return;
-      if (!dayMap[d]) dayMap[d] = { date: d, rev: 0, inH: 0, del: 0, items: 0 };
+      if (!dayMap[d]) dayMap[d] = { date: d, rev: 0, inH: 0, del: 0, tk: 0, items: 0 };
       dayMap[d].rev += o.total;
       if (o.type === "mixed" && o.items) {
         o.items.forEach(function (i) {
           var lr = i.price * i.qty;
-          if (i.lineType === "delivery") dayMap[d].del += lr; else dayMap[d].inH += lr;
+          if (i.lineType === "delivery") dayMap[d].del += lr;
+          else if (i.lineType === "takeaway") dayMap[d].tk += lr;
+          else dayMap[d].inH += lr;
         });
       } else if (o.type === "delivery") {
         dayMap[d].del += o.total;
+      } else if (o.type === "takeaway") {
+        dayMap[d].tk += o.total;
       } else {
         dayMap[d].inH += o.total;
       }
@@ -5920,6 +6107,9 @@ function App() {
     setInv(INV_SEED);
     setAdjustments({});
     setMenuItems(MENU);
+    setMenuStockLevels({});
+    setMenuStockAdjustments([]);
+    setStockAdjustments([]);
     setCart([]);
     setCapitalInjections([]);
     setOwnerLoans([]);
@@ -6399,7 +6589,39 @@ function App() {
       gap: 5,
       flexShrink: 0
     }
-  }, "\uD83D\uDEAA Logout"), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDEAA Logout"), /*#__PURE__*/React.createElement("button", {
+    onClick: toggleTheme,
+    title: theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
+    style: {
+      background: "transparent",
+      border: "1px solid " + C.border,
+      color: C.muted,
+      borderRadius: 8,
+      padding: "7px 10px",
+      cursor: "pointer",
+      fontSize: 14,
+      display: "flex",
+      alignItems: "center",
+      gap: 5,
+      flexShrink: 0
+    }
+  }, theme === "dark" ? "\u2600\uFE0F" : "\uD83C\uDF19"), /*#__PURE__*/React.createElement("button", {
+    onClick: toggleFullscreen,
+    title: isFullscreen ? "Exit full screen" : "Full screen",
+    style: {
+      background: "transparent",
+      border: "1px solid " + C.border,
+      color: C.muted,
+      borderRadius: 8,
+      padding: "7px 10px",
+      cursor: "pointer",
+      fontSize: 14,
+      display: "flex",
+      alignItems: "center",
+      gap: 5,
+      flexShrink: 0
+    }
+  }, isFullscreen ? "\u26F6" : "\u2922"), /*#__PURE__*/React.createElement("div", {
     style: {
       width: 1,
       alignSelf: "stretch",
@@ -6472,7 +6694,7 @@ function App() {
       fontSize: 12,
       fontWeight: 700,
       cursor: dayOpen ? "pointer" : "not-allowed",
-      colorScheme: "dark",
+      colorScheme: C.colorScheme,
       opacity: dayOpen ? 1 : 0.6
     }
   })), userMode === "manager" && /*#__PURE__*/React.createElement("div", {
@@ -6649,13 +6871,11 @@ function App() {
       paddingBottom: 4
     }
   }, menuF.map(function (item) {
-    const keyDineIn = item.id + "_dine-in";
-    const keyDelivery = item.id + "_delivery";
     const inCartCurrent = cart.find(function (x) {
       return x.cartKey === item.id + "_" + orderType;
     });
     const inCartOther = cart.find(function (x) {
-      return x.cartKey === (orderType === "dine-in" ? keyDelivery : keyDineIn);
+      return x.id === item.id && x.cartKey !== item.id + "_" + orderType;
     });
     const isCombo = Array.isArray(item.icon);
     const stockInfo = menuStockLevels[item.id] || { current: 0 };
@@ -6743,7 +6963,7 @@ function App() {
         position: "absolute",
         top: 4,
         right: 4,
-        background: inCartOther.lineType === "dine-in" ? C.green : C.blue,
+        background: otMeta(inCartOther.lineType).color,
         borderRadius: "50%",
         width: 8,
         height: 8,
@@ -6789,13 +7009,13 @@ function App() {
       gap: 5,
       marginBottom: 8
     }
-  }, [["dine-in", "🍽️ Dine-In", C.green], ["delivery", "🛵 Delivery", C.blue]].map(function (x) {
+  }, [["dine-in", "🍽️ Dine-In", C.green], ["delivery", "🛵 Delivery", C.blue], ["takeaway", "📦 Takeaway", C.gold]].map(function (x) {
     const t = x[0],
       l = x[1],
       col = x[2];
     return /*#__PURE__*/React.createElement("button", {
       key: t,
-      onClick: () => setOrderType(t),
+      onClick: () => switchOrderType(t),
       style: bs(orderType === t, col, {
         flex: 1,
         padding: "6px 4px",
@@ -6841,7 +7061,7 @@ function App() {
     }
   }, "Tap items to add")) : cart.map(function (item) {
     const isCombo = Array.isArray(item.icon);
-    const isDineIn = item.lineType === "dine-in";
+    const lineMeta = otMeta(item.lineType);
     return /*#__PURE__*/React.createElement("div", {
       key: item.cartKey,
       style: {
@@ -6851,7 +7071,7 @@ function App() {
         padding: "6px 8px",
         background: C.card,
         borderRadius: 7,
-        border: "1px solid " + (isDineIn ? C.green + "55" : C.blue + "55")
+        border: "1px solid " + lineMeta.color + "55"
       }
     }, /*#__PURE__*/React.createElement("span", {
       style: {
@@ -6882,12 +7102,12 @@ function App() {
       style: {
         fontSize: 9,
         fontWeight: 700,
-        color: isDineIn ? C.green : C.blue,
-        background: (isDineIn ? C.green : C.blue) + "22",
+        color: lineMeta.color,
+        background: lineMeta.color + "22",
         borderRadius: 3,
         padding: "1px 5px"
       }
-    }, isDineIn ? "🍽️ Dine-In" : "🛵 Delivery"), /*#__PURE__*/React.createElement("span", {
+    }, lineMeta.icon + " " + lineMeta.label), /*#__PURE__*/React.createElement("span", {
       style: {
         fontSize: 10,
         color: C.muted
@@ -7033,7 +7253,43 @@ function App() {
     return x.lineType === "delivery";
   }).reduce(function (s, x) {
     return s + x.qty;
-  }, 0), " delivery"))), /*#__PURE__*/React.createElement("div", {
+  }, 0), " delivery"), cartHasTakeaway && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.gold,
+      marginLeft: 6
+    }
+  }, "\uD83D\uDCE6 ", cart.filter(function (x) {
+    return x.lineType === "takeaway";
+  }).reduce(function (s, x) {
+    return s + x.qty;
+  }, 0), " takeaway"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "baseline",
+      marginBottom: 9
+    }
+  }, discountAmount > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      color: C.muted
+    }
+  }, "Subtotal"), discountAmount > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      color: C.muted
+    }
+  }, "Kes ", total.toLocaleString())), discountAmount > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "baseline",
+      marginBottom: 6,
+      fontSize: 12,
+      color: C.gold
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Discount"), /*#__PURE__*/React.createElement("span", null, "-Kes ", discountAmount.toLocaleString())), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -7051,12 +7307,31 @@ function App() {
       fontWeight: 800,
       color: C.accent
     }
-  }, "Kes ", total.toLocaleString())), /*#__PURE__*/React.createElement("div", {
+  }, "Kes ", finalTotal.toLocaleString())), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6
     }
   }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      const newDiscount = prompt("Discount (Kes):", orderDiscount || "");
+      if (newDiscount !== null) {
+        const val = parseFloat(newDiscount) || 0;
+        setOrderDiscount(Math.max(0, val));
+      }
+    },
+    style: {
+      background: discountAmount > 0 ? C.gold + "22" : C.surf2,
+      border: "1px solid " + (discountAmount > 0 ? C.gold + "55" : C.border),
+      color: discountAmount > 0 ? C.gold : C.muted,
+      borderRadius: 7,
+      padding: "8px",
+      width: 36,
+      cursor: "pointer",
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "🏷️"), /*#__PURE__*/React.createElement("button", {
     onClick: () => setCart([]),
     style: {
       background: "transparent",
@@ -7081,7 +7356,7 @@ function App() {
       fontWeight: 700,
       fontSize: 12
     }
-  }, "Charge Kes ", total.toLocaleString(), " \u2192"))))) // end dayOpen
+  }, "Charge Kes ", finalTotal.toLocaleString(), " \u2192"))))) // end dayOpen
   ), mod === "orders" && function () {
     // Use the memoized filter (computed outside render for perf)
     const filteredOrders = filteredOrdersMemo;
@@ -7179,7 +7454,105 @@ function App() {
         alignItems: "center",
         gap: 6
       }
-    }, "\uD83D\uDDA8\uFE0F Print Summary (", filteredOrders.length, ")")), /*#__PURE__*/React.createElement("div", {
+    }, "\uD83D\uDDA8\uFE0F Print Summary (", filteredOrders.length, ")")), unpaidOrders.length > 0 && /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: "#2A1E00",
+        border: "1px solid " + C.gold + "55",
+        borderRadius: 11,
+        padding: "12px 14px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom: 10,
+        flexWrap: "wrap",
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontWeight: 700,
+        color: C.gold,
+        fontSize: 13
+      }
+    }, "\uD83D\uDCCB Outstanding Tabs \u2014 settle before closing the day (Kes ", unpaidTotal.toLocaleString(), ")"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.muted
+      }
+    }, unpaidOrders.length, " unpaid order", unpaidOrders.length !== 1 ? "s" : "")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 6
+      }
+    }, unpaidOrders.map(function (o) {
+      return /*#__PURE__*/React.createElement("div", {
+        key: "orderstab-" + o.id,
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: 9,
+          padding: "8px 11px",
+          background: C.card,
+          borderRadius: 8,
+          border: "1px solid " + C.gold + "33"
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 15
+        }
+      }, otMeta(o.type).icon), /*#__PURE__*/React.createElement("div", {
+        style: {
+          flex: 1,
+          minWidth: 0
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12,
+          fontWeight: 700
+        }
+      }, "Order #", o.no, o.note && /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: C.muted,
+          fontWeight: 400
+        }
+      }, " \xB7 ", o.note)), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 10,
+          color: C.muted
+        }
+      }, o.date, o.date !== currentDate ? /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: C.gold
+        }
+      }, " (prev day)") : "", " \xB7 ", o.time, " \xB7 ", o.itemCount, " items")), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 14,
+          fontWeight: 800,
+          color: C.gold,
+          marginRight: 8
+        }
+      }, "Kes ", o.total.toLocaleString()), /*#__PURE__*/React.createElement("button", {
+        onClick: function () {
+          setSettleTabId(o.id);
+          setSettleMethod("cash");
+          setSettleCashReceived("");
+        },
+        style: {
+          background: C.green,
+          border: "none",
+          color: "#fff",
+          borderRadius: 7,
+          padding: "6px 12px",
+          cursor: "pointer",
+          fontWeight: 700,
+          fontSize: 11,
+          flexShrink: 0
+        }
+      }, "Settle"));
+    }))), /*#__PURE__*/React.createElement("div", {
       style: cs({
         padding: "12px 14px"
       })
@@ -7231,7 +7604,7 @@ function App() {
         padding: "5px 8px",
         color: C.text,
         fontSize: 11,
-        colorScheme: "dark"
+        colorScheme: C.colorScheme
       }
     }), /*#__PURE__*/React.createElement("span", {
       style: {
@@ -7251,7 +7624,7 @@ function App() {
         padding: "5px 8px",
         color: C.text,
         fontSize: 11,
-        colorScheme: "dark"
+        colorScheme: C.colorScheme
       }
     })), /*#__PURE__*/React.createElement("div", {
       style: {
@@ -7275,13 +7648,13 @@ function App() {
         display: "flex",
         gap: 4
       }
-    }, [["all", "All Types"], ["dine-in", "🍽 Dine-In"], ["delivery", "🛵 Delivery"]].map(function (x) {
+    }, [["all", "All Types"], ["dine-in", "🍽 Dine-In"], ["delivery", "🛵 Delivery"], ["takeaway", "📦 Takeaway"]].map(function (x) {
       return /*#__PURE__*/React.createElement("button", {
         key: x[0],
         onClick: function () {
           setOrderHistType(x[0]);
         },
-        style: bs(orderHistType === x[0], x[0] === "delivery" ? C.blue : C.green, {
+        style: bs(orderHistType === x[0], x[0] === "all" ? C.accent : otMeta(x[0]).color, {
           fontSize: 11,
           padding: "5px 10px"
         })
@@ -7563,9 +7936,9 @@ function App() {
       }, /*#__PURE__*/React.createElement("span", {
         style: {
           fontSize: 10,
-          color: o.type === "delivery" ? C.blue : C.green
+          color: otMeta(o.type).color
         }
-      }, o.type === "delivery" ? "🛵 Delivery" : "🍽️ Dine-In")), /*#__PURE__*/React.createElement("td", {
+      }, otMeta(o.type).icon + " " + otMeta(o.type).label)), /*#__PURE__*/React.createElement("td", {
         style: {
           padding: "8px 10px"
         }
@@ -7622,7 +7995,25 @@ function App() {
           cursor: "pointer",
           fontSize: 11
         }
-      }, "\uD83D\uDDA8\uFE0F"), !o.voided && /*#__PURE__*/React.createElement("button", {
+      }, "\uD83D\uDDA8\uFE0F"), o.unpaid && !o.voided && /*#__PURE__*/React.createElement("button", {
+        onClick: function (e) {
+          e.stopPropagation();
+          setSettleTabId(o.id);
+          setSettleMethod("cash");
+          setSettleCashReceived("");
+        },
+        title: "Settle this tab",
+        style: {
+          background: C.green + "22",
+          border: "1px solid " + C.green + "44",
+          color: C.green,
+          borderRadius: 5,
+          padding: "3px 8px",
+          cursor: "pointer",
+          fontSize: 11,
+          fontWeight: 700
+        }
+      }, "\uD83D\uDCB5 Settle"), !o.voided && /*#__PURE__*/React.createElement("button", {
         onClick: function (e) {
           e.stopPropagation();
           setEditOrderId(o.id);
@@ -7780,8 +8171,8 @@ function App() {
       col: C.text
     }, {
       lbl: "Type",
-      val: selectedOrder.type === "delivery" ? "🛵 Delivery" : "🍽️ Dine-In",
-      col: selectedOrder.type === "delivery" ? C.blue : C.green
+      val: otMeta(selectedOrder.type).icon + " " + otMeta(selectedOrder.type).label,
+      col: otMeta(selectedOrder.type).color
     }, {
       lbl: "Payment",
       val: selectedOrder.unpaid ? "📋 Tab" : selectedOrder.payment === "mpesa" ? "📱 M-Pesa" : "💵 Cash",
@@ -7946,7 +8337,24 @@ function App() {
         fontWeight: 700,
         fontSize: 12
       }
-    }, "\u270F\uFE0F Edit Order")))));
+    }, "\u270F\uFE0F Edit Order"), selectedOrder.unpaid && !selectedOrder.voided && /*#__PURE__*/React.createElement("button", {
+      onClick: function () {
+        setSettleTabId(selectedOrder.id);
+        setSettleMethod("cash");
+        setSettleCashReceived("");
+      },
+      style: {
+        flex: 1,
+        background: C.green,
+        border: "none",
+        color: "#fff",
+        borderRadius: 7,
+        padding: "9px",
+        cursor: "pointer",
+        fontWeight: 700,
+        fontSize: 12
+      }
+    }, "\uD83D\uDCB5 Settle Tab")))));
   }(), mod === "register" && /*#__PURE__*/React.createElement("div", {
     style: {
       maxWidth: 920,
@@ -8089,7 +8497,7 @@ function App() {
       style: {
         fontSize: 15
       }
-    }, o.type === "dine-in" ? "🍽️" : "🛵"), /*#__PURE__*/React.createElement("div", {
+    }, otMeta(o.type).icon), /*#__PURE__*/React.createElement("div", {
       style: {
         flex: 1,
         minWidth: 0
@@ -8364,7 +8772,7 @@ function App() {
       style: {
         fontSize: 15
       }
-    }, o.type === "dine-in" ? "🍽️" : "🛵"), /*#__PURE__*/React.createElement("div", {
+    }, otMeta(o.type).icon), /*#__PURE__*/React.createElement("div", {
       style: {
         flex: 1
       }
@@ -8375,9 +8783,9 @@ function App() {
       }
     }, "Order #", o.no, " \xB7 ", /*#__PURE__*/React.createElement("span", {
       style: {
-        color: o.type === "dine-in" ? C.green : C.blue
+        color: otMeta(o.type).color
       }
-    }, o.type === "dine-in" ? "Dine-In" : "Delivery"), o.note ? " · " + o.note : "", o.voided && /*#__PURE__*/React.createElement("span", {
+    }, otMeta(o.type).label), o.note ? " · " + o.note : "", o.voided && /*#__PURE__*/React.createElement("span", {
       style: {
         color: C.red,
         marginLeft: 6,
@@ -9389,7 +9797,7 @@ function App() {
       padding: "7px 11px",
       color: C.gold,
       fontSize: 13,
-      colorScheme: "dark",
+      colorScheme: C.colorScheme,
       width: "100%"
     }
   })), /*#__PURE__*/React.createElement("div", {
@@ -9448,7 +9856,7 @@ function App() {
       padding: "8px 11px",
       color: prodMenuId ? C.text : C.muted,
       fontSize: 12,
-      colorScheme: "dark"
+      colorScheme: C.colorScheme
     }
   }, /*#__PURE__*/React.createElement("option", {
     value: ""
@@ -9655,7 +10063,7 @@ function App() {
       padding: "7px 9px",
       color: prodManualInvId ? C.text : C.muted,
       fontSize: 12,
-      colorScheme: "dark"
+      colorScheme: C.colorScheme
     }
   }, /*#__PURE__*/React.createElement("option", {
     value: ""
@@ -10152,12 +10560,20 @@ function App() {
       style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.88)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 999, padding: 16 }
     },
       /*#__PURE__*/React.createElement("div", { style: cs({ maxWidth: 360, width: "100%", display: "flex", flexDirection: "column", gap: 10 }) },
-        /*#__PURE__*/React.createElement("div", { style: { fontWeight: 700, fontSize: 15 } }, "\u2696\uFE0F Adjust Stock \u2014 " + adjItem.name),
-        /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, color: C.muted } }, "Currently " + adjItem.stock + " " + adjItem.unit + " on hand. Use this to correct the balance after a stocktake, spoilage, or to set an opening balance \u2014 it will not create any expense or Purchase Order entry."),
+        /*#__PURE__*/React.createElement("div", { style: { fontWeight: 700, fontSize: 15 } }, "\uD83D\uDD12 Admin: Adjust Stock \u2014 " + adjItem.name),
+        /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, color: C.muted } }, "Currently " + adjItem.stock + " " + adjItem.unit + " on hand at Kes " + adjItem.costPer + "/" + adjItem.unit + ". Use this to correct the balance after a stocktake, spoilage, or to set an opening balance \u2014 it will not create any expense or Purchase Order entry. Manager PIN required and logged for audit."),
         /*#__PURE__*/React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4 } },
           /*#__PURE__*/React.createElement("div", { style: { fontSize: 11, color: C.muted, fontWeight: 700 } }, "New qty on hand (" + adjItem.unit + ")"),
           /*#__PURE__*/React.createElement("input", {
             type: "number", value: stockAdjustQty, onChange: function (e) { setStockAdjustQty(e.target.value); setStockAdjustError(""); },
+            style: { background: C.card, color: C.text, border: "1px solid " + C.border, borderRadius: 8, padding: "10px", fontSize: 16 }
+          })
+        ),
+        /*#__PURE__*/React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4 } },
+          /*#__PURE__*/React.createElement("div", { style: { fontSize: 11, color: C.muted, fontWeight: 700 } }, "Cost per " + adjItem.unit + " (Kes)"),
+          /*#__PURE__*/React.createElement("input", {
+            type: "number", min: 0, step: "0.01", value: stockAdjustCost,
+            onChange: function (e) { setStockAdjustCost(e.target.value); setStockAdjustError(""); },
             style: { background: C.card, color: C.text, border: "1px solid " + C.border, borderRadius: 8, padding: "10px", fontSize: 16 }
           })
         ),
@@ -10167,6 +10583,14 @@ function App() {
             placeholder: "e.g. Stocktake correction, spoilage, opening balance", value: stockAdjustReason,
             onChange: function (e) { setStockAdjustReason(e.target.value); setStockAdjustError(""); },
             style: { background: C.card, color: C.text, border: "1px solid " + C.border, borderRadius: 8, padding: "10px" }
+          })
+        ),
+        /*#__PURE__*/React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4 } },
+          /*#__PURE__*/React.createElement("div", { style: { fontSize: 11, color: C.muted, fontWeight: 700 } }, "Manager PIN"),
+          /*#__PURE__*/React.createElement("input", {
+            type: "password", inputMode: "numeric", placeholder: "Manager PIN", value: stockAdjustPin,
+            onChange: function (e) { setStockAdjustPin(e.target.value); setStockAdjustError(""); },
+            style: { background: C.card, color: C.text, border: "1px solid " + C.border, borderRadius: 8, padding: "10px", fontSize: 16, letterSpacing: 3, textAlign: "center" }
           })
         ),
         stockAdjustError && /*#__PURE__*/React.createElement("div", { style: { color: C.red, fontSize: 12 } }, stockAdjustError),
@@ -10234,7 +10658,7 @@ function App() {
       padding: "4px 8px",
       color: C.gold,
       fontSize: 11,
-      colorScheme: "dark"
+      colorScheme: C.colorScheme
     }
   }), /*#__PURE__*/React.createElement("button", {
     onClick: function () {
@@ -10401,7 +10825,7 @@ function App() {
       color: C.gold,
       fontSize: 13,
       width: "100%",
-      colorScheme: "dark"
+      colorScheme: C.colorScheme
     }
   })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -10594,7 +11018,7 @@ function App() {
       color: lineInvId ? C.text : C.muted,
       fontSize: 12,
       width: "100%",
-      colorScheme: "dark",
+      colorScheme: C.colorScheme,
       marginBottom: 6
     }
   }, /*#__PURE__*/React.createElement("option", {
@@ -11304,7 +11728,7 @@ function App() {
             padding: "6px 8px",
             color: C.gold,
             fontSize: 12,
-            colorScheme: "dark",
+            colorScheme: C.colorScheme,
             outline: "none"
           }
         })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
@@ -12029,7 +12453,7 @@ function App() {
         color: supplierDraft.category ? C.text : C.muted,
         fontSize: 12,
         width: "100%",
-        colorScheme: "dark"
+        colorScheme: C.colorScheme
       }
     }, /*#__PURE__*/React.createElement("option", {
       value: ""
@@ -12136,7 +12560,7 @@ function App() {
       },
       style: {
         background: C.card, border: "1px solid " + C.border, borderRadius: 7,
-        padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: "dark"
+        padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: C.colorScheme
       }
     }, [["cod", "Cash on Delivery"], ["7", "7-day credit"], ["14", "14-day credit"], ["30", "30-day credit"]].map(function (t) {
       return /*#__PURE__*/React.createElement("option", { key: t[0], value: t[0] }, t[1]);
@@ -12162,7 +12586,7 @@ function App() {
       },
       style: {
         background: C.card, border: "1px solid " + C.border, borderRadius: 7,
-        padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: "dark"
+        padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: C.colorScheme
       }
     }, [["active", "Active"], ["inactive", "Inactive"]].map(function (t) {
       return /*#__PURE__*/React.createElement("option", { key: t[0], value: t[0] }, t[1]);
@@ -12668,7 +13092,7 @@ function App() {
             type: "date",
             value: payDraft.date || currentDate,
             onChange: function (e) { setPayDraft(Object.assign({}, payDraft, { date: e.target.value })); },
-            style: { background: C.surf2, border: "1px solid " + C.border, borderRadius: 7, padding: "9px 10px", color: C.gold, fontSize: 13, colorScheme: "dark" }
+            style: { background: C.surf2, border: "1px solid " + C.border, borderRadius: 7, padding: "9px 10px", color: C.gold, fontSize: 13, colorScheme: C.colorScheme }
           }),
           /*#__PURE__*/React.createElement("select", {
             value: payDraft.method,
@@ -12791,7 +13215,7 @@ function App() {
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
-      gridTemplateColumns: "repeat(4,1fr)",
+      gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
       gap: 9
     }
   }, [{
@@ -12817,6 +13241,14 @@ function App() {
     ic: "🛵",
     sub: orders.filter(function (o) {
       return o.date === currentDate && o.type === "delivery";
+    }).length + " orders"
+  }, {
+    lbl: "Takeaway Today",
+    val: fmtK(todayTakeaway),
+    col: C.gold,
+    ic: "📦",
+    sub: orders.filter(function (o) {
+      return o.date === currentDate && o.type === "takeaway";
     }).length + " orders"
   }, {
     lbl: "Mar 2026 Total",
@@ -12858,10 +13290,10 @@ function App() {
   })), orders.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
-      gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
+      gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr",
       gap: 10
     }
-  }, [["dine-in", "🍽️ Dine-In Orders Today", C.green], ["delivery", "🛵 Delivery Orders Today", C.blue]].map(function (x) {
+  }, [["dine-in", "🍽️ Dine-In Orders Today", C.green], ["delivery", "🛵 Delivery Orders Today", C.blue], ["takeaway", "📦 Takeaway Orders Today", C.gold]].map(function (x) {
     const type = x[0],
       title = x[1],
       col = x[2];
@@ -12927,7 +13359,7 @@ function App() {
       style: {
         color: col
       }
-    }, "Kes ", (type === "dine-in" ? todayInH : todayDel).toLocaleString()))));
+    }, "Kes ", (type === "dine-in" ? todayInH : type === "delivery" ? todayDel : todayTakeaway).toLocaleString()))));
   })), /*#__PURE__*/React.createElement("div", {
     style: cs()
   }, /*#__PURE__*/React.createElement("div", {
@@ -12940,7 +13372,7 @@ function App() {
   }, new Date(currentDate).toLocaleString("en-KE", {
     month: "long",
     year: "numeric"
-  }), " \u2014 Daily Revenue: Dine-In vs Delivery"), MAR_DATA.length === 0 ? /*#__PURE__*/React.createElement("div", {
+  }), " \u2014 Daily Revenue: Dine-In vs Delivery vs Takeaway"), MAR_DATA.length === 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       textAlign: "center",
       padding: "36px 20px",
@@ -12998,7 +13430,7 @@ function App() {
     style: {
       borderBottom: "1px solid " + C.border
     }
-  }, ["Date", "Total", "Dine-In", "Delivery", "Items", "Avg/Item"].map(function (h) {
+  }, ["Date", "Total", "Dine-In", "Delivery", "Takeaway", "Items", "Avg/Item"].map(function (h) {
     return /*#__PURE__*/React.createElement("th", {
       key: h,
       style: {
@@ -13038,6 +13470,11 @@ function App() {
         color: C.blue
       }
     }, "Kes ", d.del.toLocaleString()), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "5px 10px",
+        color: C.gold
+      }
+    }, "Kes ", (d.tk || 0).toLocaleString()), /*#__PURE__*/React.createElement("td", {
       style: {
         padding: "5px 10px",
         color: C.muted
@@ -13083,6 +13520,13 @@ function App() {
   }, 0).toLocaleString()), /*#__PURE__*/React.createElement("td", {
     style: {
       padding: "7px 10px",
+      color: C.gold
+    }
+  }, "Kes ", MAR_DATA.reduce(function (s, d) {
+    return s + (d.tk || 0);
+  }, 0).toLocaleString()), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px",
       color: C.muted
     }
   }, MAR_DATA.reduce(function (s, d) {
@@ -13107,20 +13551,25 @@ function App() {
         revenue: 0,
         dineIn: 0,
         delivery: 0,
+        takeaway: 0,
         items: 0,
         cash: 0,
         mpesa: 0
       };
       dayMap[d].orders++;
       dayMap[d].revenue += o.total;
-      // Split dine-in vs delivery — handle mixed orders at item level
+      // Split dine-in vs delivery vs takeaway — handle mixed orders at item level
       if (o.type === "mixed" && o.items) {
         o.items.forEach(function (i) {
           const lineRev = i.price * i.qty;
-          if (i.lineType === "delivery") dayMap[d].delivery += lineRev;else dayMap[d].dineIn += lineRev;
+          if (i.lineType === "delivery") dayMap[d].delivery += lineRev;
+          else if (i.lineType === "takeaway") dayMap[d].takeaway += lineRev;
+          else dayMap[d].dineIn += lineRev;
         });
       } else if (o.type === "delivery") {
         dayMap[d].delivery += o.total;
+      } else if (o.type === "takeaway") {
+        dayMap[d].takeaway += o.total;
       } else {
         dayMap[d].dineIn += o.total;
       }
@@ -13146,6 +13595,9 @@ function App() {
     }, 0);
     const grandDel = rows.reduce(function (s, r) {
       return s + r.delivery;
+    }, 0);
+    const grandTk = rows.reduce(function (s, r) {
+      return s + r.takeaway;
     }, 0);
     const grandCash = rows.reduce(function (s, r) {
       return s + r.cash;
@@ -13501,6 +13953,11 @@ function App() {
       val: grandDel,
       col: C.accent,
       ic: "🛵"
+    }, {
+      lbl: "Takeaway",
+      val: grandTk,
+      col: C.gold,
+      ic: "📦"
     }].map(function (p) {
       const pct2 = grandRev > 0 ? Math.round(p.val / grandRev * 100) : 0;
       return /*#__PURE__*/React.createElement("div", {
@@ -13583,7 +14040,7 @@ function App() {
       style: {
         borderBottom: "2px solid " + C.border
       }
-    }, ["Date", "Day", "Orders", "Revenue", "Dine-In", "Delivery", "Items", "Avg/Order", "Cash", "M-Pesa"].map(function (h) {
+    }, ["Date", "Day", "Orders", "Revenue", "Dine-In", "Delivery", "Takeaway", "Items", "Avg/Order", "Cash", "M-Pesa"].map(function (h) {
       return /*#__PURE__*/React.createElement("th", {
         key: h,
         style: {
@@ -13657,6 +14114,12 @@ function App() {
         style: {
           padding: "6px 10px",
           textAlign: "right",
+          color: C.gold
+        }
+      }, "Kes ", r.takeaway.toLocaleString()), /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "6px 10px",
+          textAlign: "right",
           color: C.muted
         }
       }, r.items), /*#__PURE__*/React.createElement("td", {
@@ -13720,6 +14183,12 @@ function App() {
         color: C.blue
       }
     }, "Kes ", grandDel.toLocaleString()), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 10px",
+        textAlign: "right",
+        color: C.gold
+      }
+    }, "Kes ", grandTk.toLocaleString()), /*#__PURE__*/React.createElement("td", {
       style: {
         padding: "8px 10px",
         textAlign: "right",
@@ -14856,7 +15325,7 @@ function App() {
       color: C.gold,
       fontSize: 11,
       fontWeight: 700,
-      colorScheme: "dark",
+      colorScheme: C.colorScheme,
       outline: "none",
       cursor: "pointer"
     }
@@ -14878,7 +15347,7 @@ function App() {
       color: C.gold,
       fontSize: 11,
       fontWeight: 700,
-      colorScheme: "dark",
+      colorScheme: C.colorScheme,
       outline: "none",
       cursor: "pointer"
     }
@@ -15883,6 +16352,7 @@ function App() {
           revenue: 0,
           dineIn: 0,
           delivery: 0,
+          takeaway: 0,
           items: 0,
           cash: 0,
           mpesa: 0,
@@ -15890,14 +16360,18 @@ function App() {
         };
         dayMap[d].orders++;
         dayMap[d].revenue += o.total;
-        // dine-in vs delivery — handle mixed orders at item level (same as salesbydate tab)
+        // dine-in vs delivery vs takeaway — handle mixed orders at item level (same as salesbydate tab)
         if (o.type === "mixed" && o.items) {
           o.items.forEach(function (i) {
             var lineRev = i.price * i.qty;
-            if (i.lineType === "delivery") dayMap[d].delivery += lineRev;else dayMap[d].dineIn += lineRev;
+            if (i.lineType === "delivery") dayMap[d].delivery += lineRev;
+            else if (i.lineType === "takeaway") dayMap[d].takeaway += lineRev;
+            else dayMap[d].dineIn += lineRev;
           });
         } else if (o.type === "delivery") {
           dayMap[d].delivery += o.total;
+        } else if (o.type === "takeaway") {
+          dayMap[d].takeaway += o.total;
         } else {
           dayMap[d].dineIn += o.total;
         }
@@ -15921,7 +16395,7 @@ function App() {
         if (!expByDay[d]) expByDay[d] = 0;
         expByDay[d] += e.amount || 0;
       });
-      var hdrs = ["Date", "Day", "Orders", "Revenue (Kes)", "Dine-In (Kes)", "Delivery (Kes)", "Items Sold", "Avg Order (Kes)", "Cash (Kes)", "M-Pesa (Kes)", "Open Tabs (Kes)", "Expenses (Kes)", "Net (Kes)"];
+      var hdrs = ["Date", "Day", "Orders", "Revenue (Kes)", "Dine-In (Kes)", "Delivery (Kes)", "Takeaway (Kes)", "Items Sold", "Avg Order (Kes)", "Cash (Kes)", "M-Pesa (Kes)", "Open Tabs (Kes)", "Expenses (Kes)", "Net (Kes)"];
       var rows = Object.values(dayMap).sort(function (a, b) {
         return a.date.localeCompare(b.date);
       }).map(function (r) {
@@ -15929,16 +16403,16 @@ function App() {
         var exp = expByDay[r.date] || 0;
         var net = r.revenue - exp;
         var avg = r.orders > 0 ? Math.round(r.revenue / r.orders) : 0;
-        return [r.date, dn, r.orders, r.revenue, r.dineIn, r.delivery, r.items, avg, r.cash, r.mpesa, r.tabs, exp, net];
+        return [r.date, dn, r.orders, r.revenue, r.dineIn, r.delivery, r.takeaway, r.items, avg, r.cash, r.mpesa, r.tabs, exp, net];
       });
       // Totals row
       if (rows.length > 0) {
         var tot = rows.reduce(function (s, r) {
-          return ["", " ", "TOTAL", s[3] + r[3], s[4] + r[4], s[5] + r[5], s[6] + r[6], "", s[8] + r[8], s[9] + r[9], s[10] + r[10], s[11] + r[11], s[12] + r[12]];
+          return ["", " ", "TOTAL", s[3] + r[3], s[4] + r[4], s[5] + r[5], s[6] + r[6], s[7] + r[7], "", s[9] + r[9], s[10] + r[10], s[11] + r[11], s[12] + r[12], s[13] + r[13]];
         });
         tot[0] = "TOTAL";
         tot[1] = "";
-        tot[7] = rows.reduce(function (s, r) {
+        tot[8] = rows.reduce(function (s, r) {
           return s + r[3];
         }, 0) / rows.length | 0;
         rows.push(tot);
@@ -16063,6 +16537,7 @@ function App() {
           revenue: 0,
           dineIn: 0,
           delivery: 0,
+          takeaway: 0,
           cash: 0,
           mpesa: 0,
           tabs: 0
@@ -16072,9 +16547,13 @@ function App() {
         if (o.type === "mixed" && o.items) {
           o.items.forEach(function (i) {
             var lr = i.price * i.qty;
-            if (i.lineType === "delivery") dayMap3[d].delivery += lr;else dayMap3[d].dineIn += lr;
+            if (i.lineType === "delivery") dayMap3[d].delivery += lr;
+            else if (i.lineType === "takeaway") dayMap3[d].takeaway += lr;
+            else dayMap3[d].dineIn += lr;
           });
-        } else if (o.type === "delivery") dayMap3[d].delivery += o.total;else dayMap3[d].dineIn += o.total;
+        } else if (o.type === "delivery") dayMap3[d].delivery += o.total;
+        else if (o.type === "takeaway") dayMap3[d].takeaway += o.total;
+        else dayMap3[d].dineIn += o.total;
         if (o.unpaid) dayMap3[d].tabs += o.total;else if (o.payment === "cash") dayMap3[d].cash += o.total;else if (o.payment === "mpesa") dayMap3[d].mpesa += o.total;
       });
       var expByDay3 = {};
@@ -16130,11 +16609,11 @@ function App() {
       var css = ["*{box-sizing:border-box;margin:0;padding:0;}", "body{font-family:Arial,sans-serif;font-size:12px;color:#111;padding:28px;max-width:800px;margin:0 auto;}", "h1{font-size:20px;margin-bottom:2px;}", "h2{font-size:14px;margin:22px 0 8px;color:#444;border-bottom:2px solid #ddd;padding-bottom:4px;page-break-after:avoid;}", ".kpis{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0;}", ".kpi{flex:1 1 140px;background:#f4f4f4;border:1px solid #ddd;border-radius:6px;padding:10px 12px;text-align:center;}", ".kpi .v{font-size:15px;font-weight:800;margin:3px 0;}", ".kpi .l{font-size:10px;color:#666;}", ".tbl-wrap{overflow-x:auto;margin-bottom:12px;}", "table{width:100%;border-collapse:collapse;font-size:11px;min-width:500px;}", "th{background:#333;color:#fff;padding:6px 8px;text-align:left;white-space:nowrap;}", "td{padding:5px 8px;border-bottom:1px solid #eee;white-space:nowrap;}", "tr.tot td{background:#f0f0f0;font-weight:700;border-top:2px solid #ccc;}", ".pl{background:#f9f9f9;border:1px solid #ddd;border-radius:6px;overflow:hidden;margin-bottom:12px;}", ".pl-r{display:flex;justify-content:space-between;padding:8px 12px;border-bottom:1px solid #eee;}", ".pl-r:last-child{border-bottom:none;background:#f0f0f0;font-weight:700;}", ".profit{color:#1a7a3a;font-weight:800;}.loss{color:#c0392b;font-weight:800;}", ".alerts{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;}", ".alert-box{flex:1 1 200px;border-radius:6px;padding:10px;font-size:11px;}", ".warn{background:#fff3cd;border:1px solid #ffc107;}.danger{background:#f8d7da;border:1px solid #f5c6cb;}", ".alert-box h3{font-size:12px;margin-bottom:6px;}", "footer{margin-top:24px;font-size:10px;color:#999;text-align:center;border-top:1px solid #ddd;padding-top:10px;}", "@media print{", " .no-print{display:none!important}", " body{padding:16px;font-size:11px;}", " h2{page-break-after:avoid;}", " .tbl-wrap{overflow:visible;}", " table{min-width:unset;}", " td,th{white-space:normal;padding:3px 5px;}", "}"].join("");
 
       // Build daily table HTML
-      var dayHtml = dayRows3.length === 0 ? "<p style='color:#666;font-style:italic;padding:8px 0'>No orders recorded yet</p>" : "<div class='tbl-wrap'><table><thead><tr>" + "<th>Date</th><th>Day</th><th>Orders</th><th>Revenue</th><th>Dine-In</th><th>Delivery</th><th>Cash</th><th>M-Pesa</th><th>Tabs</th><th>Expenses</th><th>Net</th>" + "</tr></thead><tbody>" + dayRows3.map(function (r, i) {
+      var dayHtml = dayRows3.length === 0 ? "<p style='color:#666;font-style:italic;padding:8px 0'>No orders recorded yet</p>" : "<div class='tbl-wrap'><table><thead><tr>" + "<th>Date</th><th>Day</th><th>Orders</th><th>Revenue</th><th>Dine-In</th><th>Delivery</th><th>Takeaway</th><th>Cash</th><th>M-Pesa</th><th>Tabs</th><th>Expenses</th><th>Net</th>" + "</tr></thead><tbody>" + dayRows3.map(function (r, i) {
         var dn = DAYS[new Date(r.date + "T12:00:00").getDay()];
         var exp = expByDay3[r.date] || 0;
         var net = r.revenue - exp;
-        return "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#f9f9f9") + "'>" + "<td>" + r.date + "</td><td style='color:#666'>" + dn + "</td>" + "<td style='text-align:right'>" + r.orders + "</td>" + "<td style='text-align:right;font-weight:700'>" + r.revenue.toLocaleString() + "</td>" + "<td style='text-align:right;color:#2a7a4f'>" + r.dineIn.toLocaleString() + "</td>" + "<td style='text-align:right;color:#2563a8'>" + r.delivery.toLocaleString() + "</td>" + "<td style='text-align:right'>" + r.cash.toLocaleString() + "</td>" + "<td style='text-align:right'>" + r.mpesa.toLocaleString() + "</td>" + "<td style='text-align:right;color:#b45309'>" + r.tabs.toLocaleString() + "</td>" + "<td style='text-align:right;color:#c0392b'>" + exp.toLocaleString() + "</td>" + "<td style='text-align:right;font-weight:700;color:" + (net >= 0 ? "#1a7a3a" : "#c0392b") + "'>" + net.toLocaleString() + "</td>" + "</tr>";
+        return "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#f9f9f9") + "'>" + "<td>" + r.date + "</td><td style='color:#666'>" + dn + "</td>" + "<td style='text-align:right'>" + r.orders + "</td>" + "<td style='text-align:right;font-weight:700'>" + r.revenue.toLocaleString() + "</td>" + "<td style='text-align:right;color:#2a7a4f'>" + r.dineIn.toLocaleString() + "</td>" + "<td style='text-align:right;color:#2563a8'>" + r.delivery.toLocaleString() + "</td>" + "<td style='text-align:right;color:#b8860b'>" + r.takeaway.toLocaleString() + "</td>" + "<td style='text-align:right'>" + r.cash.toLocaleString() + "</td>" + "<td style='text-align:right'>" + r.mpesa.toLocaleString() + "</td>" + "<td style='text-align:right;color:#b45309'>" + r.tabs.toLocaleString() + "</td>" + "<td style='text-align:right;color:#c0392b'>" + exp.toLocaleString() + "</td>" + "<td style='text-align:right;font-weight:700;color:" + (net >= 0 ? "#1a7a3a" : "#c0392b") + "'>" + net.toLocaleString() + "</td>" + "</tr>";
       }).join("") + "<tr class='tot'>" + "<td>TOTAL</td><td></td>" + "<td style='text-align:right'>" + dayRows3.reduce(function (s, r) {
         return s + r.orders;
       }, 0) + "</td>" + "<td style='text-align:right'>" + dayRows3.reduce(function (s, r) {
@@ -16143,6 +16622,8 @@ function App() {
         return s + r.dineIn;
       }, 0).toLocaleString() + "</td>" + "<td style='text-align:right;color:#2563a8'>" + dayRows3.reduce(function (s, r) {
         return s + r.delivery;
+      }, 0).toLocaleString() + "</td>" + "<td style='text-align:right;color:#b8860b'>" + dayRows3.reduce(function (s, r) {
+        return s + r.takeaway;
       }, 0).toLocaleString() + "</td>" + "<td style='text-align:right'>" + dayRows3.reduce(function (s, r) {
         return s + r.cash;
       }, 0).toLocaleString() + "</td>" + "<td style='text-align:right'>" + dayRows3.reduce(function (s, r) {
@@ -16331,7 +16812,7 @@ function App() {
       fn: exportOrderItems
     }, {
       title: "Daily Sales Summary",
-      desc: "Revenue, dine-in vs delivery, cash vs M-Pesa, expenses, net per day",
+      desc: "Revenue, dine-in vs delivery vs takeaway, cash vs M-Pesa, expenses, net per day",
       icon: "📅",
       count: function () {
         var d = {};
@@ -19448,7 +19929,7 @@ function App() {
         padding: "7px 10px",
         color: C.gold,
         fontSize: 13,
-        colorScheme: "dark"
+        colorScheme: C.colorScheme
       }
     })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
       style: {
@@ -19734,7 +20215,7 @@ function App() {
         padding: "7px 10px",
         color: C.gold,
         fontSize: 13,
-        colorScheme: "dark"
+        colorScheme: C.colorScheme
       }
     })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
       style: {
@@ -20534,7 +21015,7 @@ function App() {
             React.createElement("select", {
               value: financierDraft.type,
               onChange: function (e) { setFinancierDraft(function (d) { return Object.assign({}, d, { type: e.target.value }); }); },
-              style: { background: C.card, border: "1px solid " + C.border, borderRadius: 7, padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: "dark" }
+              style: { background: C.card, border: "1px solid " + C.border, borderRadius: 7, padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: C.colorScheme }
             }, Object.keys(TYPE_LABEL).map(function (k) { return React.createElement("option", { key: k, value: k }, TYPE_LABEL[k]); }))
           ),
           React.createElement("div", null,
@@ -20560,7 +21041,7 @@ function App() {
             React.createElement("select", {
               value: financierDraft.termType,
               onChange: function (e) { setFinancierDraft(function (d) { return Object.assign({}, d, { termType: e.target.value }); }); },
-              style: { background: C.card, border: "1px solid " + C.border, borderRadius: 7, padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: "dark" }
+              style: { background: C.card, border: "1px solid " + C.border, borderRadius: 7, padding: "7px 10px", color: C.text, fontSize: 12, width: "100%", colorScheme: C.colorScheme }
             }, Object.keys(TERM_LABEL).map(function (k) { return React.createElement("option", { key: k, value: k }, TERM_LABEL[k]); }))
           ),
           React.createElement("div", null,
@@ -20814,39 +21295,195 @@ function App() {
       )
     );
   }(), mod === "opreport" && userMode === "operator" && function () {
-    const todayOrders = orders.filter(o => o.date === currentDate && !o.voided);
-    const dineInToday = todayOrders.filter(o => o.type === "dine-in");
-    const deliveryToday = todayOrders.filter(o => o.type === "delivery");
-    const takeoutToday = todayOrders.filter(o => o.type === "takeout");
-    const dineInRev = dineInToday.reduce((s, o) => s + (o.total || 0), 0);
-    const deliveryRev = deliveryToday.reduce((s, o) => s + (o.total || 0), 0);
-    const takeoutRev = takeoutToday.reduce((s, o) => s + (o.total || 0), 0);
-    const totalRev = dineInRev + deliveryRev + takeoutRev;
-    
-    // Top selling items
-    const itemSales = {};
+    const todayOrders = orders.filter(o => o.date === opReportDate && !o.voided);
+
+    // Flatten every order into one row per menu item, carrying the
+    // parent order's number, type, payment method and paid/unpaid status.
+    const saleRows = [];
     todayOrders.forEach(o => {
-      if (o.items) {
-        o.items.forEach(item => {
-          if (!itemSales[item.menuId]) {
-            itemSales[item.menuId] = { name: item.name, qty: 0, revenue: 0 };
-          }
-          itemSales[item.menuId].qty += item.qty || 1;
-          itemSales[item.menuId].revenue += (item.price || 0) * (item.qty || 1);
+      const paymentLabel = o.unpaid ? "Unpaid (Tab)" : (o.payment === "cash" ? "Cash" : "M-Pesa");
+      const statusLabel = o.unpaid ? "Unpaid" : "Paid";
+      (o.items || []).forEach(item => {
+        saleRows.push({
+          orderNo: o.no,
+          type: o.type,
+          itemName: item.name,
+          qty: item.qty || 1,
+          price: item.price || 0,
+          lineTotal: (item.price || 0) * (item.qty || 1),
+          payment: paymentLabel,
+          status: statusLabel,
+          unpaid: !!o.unpaid
         });
-      }
+      });
     });
-    const topItems = Object.values(itemSales).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
-    
-    // Payment breakdown
-    const cashTotal = todayOrders.filter(o => o.paymentMethod === "cash").reduce((s, o) => s + (o.total || 0), 0);
-    const digitalTotal = todayOrders.filter(o => o.paymentMethod !== "cash").reduce((s, o) => s + (o.total || 0), 0);
-    const cashCount = todayOrders.filter(o => o.paymentMethod === "cash").length;
-    const digitalCount = todayOrders.filter(o => o.paymentMethod !== "cash").length;
-    
-    // Orders performance
-    const avgOrderValue = todayOrders.length > 0 ? totalRev / todayOrders.length : 0;
-    const totalDiscount = todayOrders.reduce((s, o) => s + (o.discount || 0), 0);
+    const grandTotal = saleRows.reduce((s, r) => s + r.lineTotal, 0);
+    const grandQty = saleRows.reduce((s, r) => s + r.qty, 0);
+
+    // Summary by menu item — aggregates the itemised sale rows above so an
+    // operator can see total qty/revenue per dish for the day at a glance,
+    // without wading through every individual order line.
+    const menuSummaryMap = {};
+    saleRows.forEach(r => {
+      if (!menuSummaryMap[r.itemName]) {
+        menuSummaryMap[r.itemName] = { itemName: r.itemName, qty: 0, revenue: 0, orders: 0 };
+      }
+      menuSummaryMap[r.itemName].qty += r.qty;
+      menuSummaryMap[r.itemName].revenue += r.lineTotal;
+      menuSummaryMap[r.itemName].orders += 1;
+    });
+    const menuSummaryRows = Object.values(menuSummaryMap).sort((a, b) => b.revenue - a.revenue);
+
+    // ── Inventory movement (today) — raw-ingredient stock changes only,
+    // pulled from the places `inv` actually gets adjusted: production
+    // runs (kitchenLog), purchase receipts (purchaseOrders), and manual
+    // stock adjustments. Sales don't touch raw material stock directly —
+    // see menuStockRows below for what a sale actually deducts.
+    const invById = {};
+    (inv || []).forEach(i => { invById[i.id] = i; });
+    const moveRows = [];
+
+    (kitchenLog || []).filter(run => run.date === opReportDate).forEach(run => {
+      (run.lines || []).forEach(l => {
+        if (!l.qty) return;
+        const item = invById[l.invId];
+        moveRows.push({
+          invId: l.invId,
+          time: run.time || "",
+          source: "Production",
+          ref: run.menuItemName ? ("→ " + run.menuItemName) : (run.note || "Manual use"),
+          item: l.name || (item ? item.name : "#" + l.invId),
+          unit: l.unit || (item ? item.unit : ""),
+          direction: "out",
+          qty: l.qty,
+          value: item ? l.qty * (item.costPer || 0) : 0
+        });
+      });
+    });
+
+    (purchaseOrders || []).filter(po => po.receivedAt && po.receivedAt.slice(0, 10) === opReportDate).forEach(po => {
+      (po.receivedLines || []).forEach(l => {
+        if (!l.qtyReceived || l.qtyReceived <= 0) return;
+        const item = invById[l.invId];
+        moveRows.push({
+          invId: l.invId,
+          time: new Date(po.receivedAt).toLocaleTimeString("en-KE", { hour: "2-digit", minute: "2-digit" }),
+          source: "Purchase",
+          ref: poSeq(po.id) + " · " + (po.supplierName || "Supplier"),
+          item: l.name || (item ? item.name : "#" + l.invId),
+          unit: item ? item.unit : "",
+          direction: "in",
+          qty: l.qtyReceived,
+          value: l.qtyReceived * (l.unitCost || 0)
+        });
+      });
+    });
+
+    (stockAdjustments || []).filter(a => a.at && a.at.slice(0, 10) === opReportDate).forEach(a => {
+      if (!a.delta) return;
+      const item = invById[a.invId];
+      moveRows.push({
+        invId: a.invId,
+        time: new Date(a.at).toLocaleTimeString("en-KE", { hour: "2-digit", minute: "2-digit" }),
+        source: "Adjustment",
+        ref: a.reason || "Manual adjustment",
+        item: a.name,
+        unit: a.unit,
+        direction: a.delta >= 0 ? "in" : "out",
+        qty: Math.abs(a.delta),
+        value: Math.abs(a.delta) * (item ? (item.costPer || 0) : (a.newCost || 0))
+      });
+    });
+
+    moveRows.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    const totalIn = moveRows.filter(r => r.direction === "in").reduce((s, r) => s + r.value, 0);
+    const totalOut = moveRows.filter(r => r.direction === "out").reduce((s, r) => s + r.value, 0);
+
+    // Opening/closing balance per raw-material item. Closing = current live
+    // stock; opening is derived by reversing today's tracked movements —
+    // this holds as long as every stock change today is one of the three
+    // movement types captured above.
+    const invBalanceRows = (inv || []).slice().sort((a, b) => a.name.localeCompare(b.name)).map(i => {
+      const itemMoves = moveRows.filter(r => r.invId === i.id);
+      const inQty = itemMoves.filter(r => r.direction === "in").reduce((s, r) => s + r.qty, 0);
+      const outQty = itemMoves.filter(r => r.direction === "out").reduce((s, r) => s + r.qty, 0);
+      const closing = i.stock || 0;
+      const opening = Math.round((closing - inQty + outQty) * 1000) / 1000;
+      return { id: i.id, name: i.name, unit: i.unit, opening, inQty, outQty, closing };
+    });
+
+    // ── Menu stock movement (today) — finished/sellable menu item stock,
+    // tracked separately from raw materials: production adds portions in,
+    // sales take portions out, and managers can manually correct counts.
+    const menuById = {};
+    (menuItems || []).forEach(m => { menuById[m.id] = m; });
+    const menuStockRows = [];
+
+    todayOrders.forEach(o => {
+      (o.items || []).forEach(item => {
+        if (!item.qty) return;
+        menuStockRows.push({
+          menuId: item.id,
+          time: o.time || "",
+          source: "Sale",
+          ref: "Order #" + o.no,
+          item: item.name,
+          unit: "portion" + (item.qty === 1 ? "" : "s"),
+          direction: "out",
+          qty: item.qty,
+          value: (item.price || 0) * item.qty
+        });
+      });
+    });
+
+    (kitchenLog || []).filter(run => run.date === opReportDate && run.type === "recipe" && run.menuItemId).forEach(run => {
+      const menuItem = menuById[run.menuItemId];
+      const portions = run.portions || 0;
+      if (!portions) return;
+      menuStockRows.push({
+        menuId: run.menuItemId,
+        time: run.time || "",
+        source: "Production",
+        ref: run.note || "Production run",
+        item: run.menuItemName || (menuItem ? menuItem.name : "#" + run.menuItemId),
+        unit: "portion" + (portions === 1 ? "" : "s"),
+        direction: "in",
+        qty: portions,
+        value: menuItem ? portions * (menuItem.price || 0) : 0
+      });
+    });
+
+    (menuStockAdjustments || []).filter(a => a.at && a.at.slice(0, 10) === opReportDate).forEach(a => {
+      if (!a.delta) return;
+      const menuItem = menuById[a.menuId];
+      menuStockRows.push({
+        menuId: a.menuId,
+        time: new Date(a.at).toLocaleTimeString("en-KE", { hour: "2-digit", minute: "2-digit" }),
+        source: "Adjustment",
+        ref: a.reason || "Manual adjustment",
+        item: a.name,
+        unit: "portion" + (Math.abs(a.delta) === 1 ? "" : "s"),
+        direction: a.delta >= 0 ? "in" : "out",
+        qty: Math.abs(a.delta),
+        value: menuItem ? Math.abs(a.delta) * (menuItem.price || 0) : 0
+      });
+    });
+
+    menuStockRows.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    const menuTotalIn = menuStockRows.filter(r => r.direction === "in").reduce((s, r) => s + r.value, 0);
+    const menuTotalOut = menuStockRows.filter(r => r.direction === "out").reduce((s, r) => s + r.value, 0);
+
+    // Opening/closing balance per menu item — same logic as raw materials,
+    // reversing today's tracked sale/production/adjustment movements out
+    // of the current live menu stock level to get the opening count.
+    const menuBalanceRows = (menuItems || []).slice().sort((a, b) => a.name.localeCompare(b.name)).map(m => {
+      const itemMoves = menuStockRows.filter(r => r.menuId === m.id);
+      const inQty = itemMoves.filter(r => r.direction === "in").reduce((s, r) => s + r.qty, 0);
+      const outQty = itemMoves.filter(r => r.direction === "out").reduce((s, r) => s + r.qty, 0);
+      const closing = (menuStockLevels[m.id] && menuStockLevels[m.id].current) || 0;
+      const opening = Math.round((closing - inQty + outQty) * 1000) / 1000;
+      return { id: m.id, name: m.name, opening, inQty, outQty, closing };
+    });
 
     // ── CSV export ──────────────────────────────────────────
     const toCSV = function (headers, rows) {
@@ -20873,110 +21510,505 @@ function App() {
     const exportDailyReport = function () {
       var kn = (typeof kitchenName !== "undefined" && kitchenName ? kitchenName : "kitchen").replace(/\s+/g, "_");
       var rows = [];
-      rows.push(["DAILY REPORT", currentDate]);
+      rows.push(["DAILY SALES REPORT (ITEMISED)", opReportDate]);
       rows.push([]);
-      rows.push(["Summary"]);
-      rows.push(["Today Total", totalRev, todayOrders.length + " orders"]);
-      rows.push(["Dine-In", dineInRev, dineInToday.length + " orders"]);
-      rows.push(["Delivery", deliveryRev, deliveryToday.length + " orders"]);
-      rows.push(["Takeout", takeoutRev, takeoutToday.length + " orders"]);
+      rows.push(["Summary by Menu Item"]);
+      rows.push(["Menu Item", "Orders", "Qty Sold", "Revenue", "% of Total"]);
+      menuSummaryRows.forEach(function (r) {
+        rows.push([r.itemName, r.orders, r.qty, r.revenue, grandTotal > 0 ? (r.revenue / grandTotal * 100).toFixed(1) + "%" : ""]);
+      });
       rows.push([]);
-      rows.push(["Top Selling Items"]);
-      rows.push(["Item", "Qty Sold", "Revenue (Kes)"]);
-      topItems.forEach(function (item) { rows.push([item.name, item.qty, item.revenue]); });
+      rows.push(["Itemised Orders"]);
+      rows.push(["Order #", "Type", "Item", "Qty", "Unit Price", "Line Total", "Payment Method", "Status"]);
+      saleRows.forEach(function (r) {
+        rows.push([r.orderNo, r.type, r.itemName, r.qty, r.price, r.lineTotal, r.payment, r.status]);
+      });
       rows.push([]);
-      rows.push(["Payment Methods"]);
-      rows.push(["Cash", cashTotal, cashCount + " transactions"]);
-      rows.push(["Digital", digitalTotal, digitalCount + " transactions"]);
+      rows.push(["", "", "", grandQty, "", grandTotal, "", ""]);
+      downloadCSV(kn + "_daily_report_" + opReportDate + ".csv", toCSV(["Order #", "Type", "Item", "Qty", "Unit Price", "Line Total", "Payment Method", "Status"], rows));
+    };
+    const exportInventoryMovement = function () {
+      var kn = (typeof kitchenName !== "undefined" && kitchenName ? kitchenName : "kitchen").replace(/\s+/g, "_");
+      var rows = [];
+      rows.push(["INVENTORY MOVEMENT REPORT (RAW MATERIALS)", opReportDate]);
       rows.push([]);
-      rows.push(["Orders Performance"]);
-      rows.push(["Total Orders", todayOrders.length]);
-      rows.push(["Avg Order Value (Kes)", avgOrderValue.toFixed(2)]);
-      rows.push(["Total Discount (Kes)", totalDiscount]);
-      rows.push(["Orders/Hour", todayOrders.length > 0 ? (todayOrders.length / 8).toFixed(1) : 0]);
-      downloadCSV(kn + "_daily_report_" + currentDate + ".csv", toCSV(["Metric", "Value", "Detail"], rows));
+      rows.push(["Stock Balances"]);
+      rows.push(["Item", "Unit", "Opening Balance", "Total In", "Total Out", "Closing Balance"]);
+      invBalanceRows.forEach(function (b) {
+        rows.push([b.name, b.unit, b.opening, b.inQty, b.outQty, b.closing]);
+      });
+      rows.push([]);
+      rows.push(["Movement Log"]);
+      moveRows.forEach(function (r) {
+        rows.push([r.time, r.source, r.item, r.direction.toUpperCase(), r.qty, r.unit, r.value.toFixed(2), r.ref]);
+      });
+      rows.push([]);
+      rows.push(["", "", "", "TOTAL IN (Kes)", "", "", totalIn.toFixed(2), ""]);
+      rows.push(["", "", "", "TOTAL OUT (Kes)", "", "", totalOut.toFixed(2), ""]);
+      downloadCSV(kn + "_inventory_movement_" + opReportDate + ".csv", toCSV(["Time", "Source", "Item", "Direction", "Qty", "Unit", "Value (Kes)", "Reference"], rows));
+    };
+    const exportMenuStockMovement = function () {
+      var kn = (typeof kitchenName !== "undefined" && kitchenName ? kitchenName : "kitchen").replace(/\s+/g, "_");
+      var rows = [];
+      rows.push(["MENU STOCK MOVEMENT REPORT", opReportDate]);
+      rows.push([]);
+      rows.push(["Stock Balances"]);
+      rows.push(["Item", "Opening Balance", "Total In", "Total Out", "Closing Balance"]);
+      menuBalanceRows.forEach(function (b) {
+        rows.push([b.name, b.opening, b.inQty, b.outQty, b.closing]);
+      });
+      rows.push([]);
+      rows.push(["Movement Log"]);
+      menuStockRows.forEach(function (r) {
+        rows.push([r.time, r.source, r.item, r.direction.toUpperCase(), r.qty, r.unit, r.value.toFixed(2), r.ref]);
+      });
+      rows.push([]);
+      rows.push(["", "", "", "TOTAL IN (Kes)", "", "", menuTotalIn.toFixed(2), ""]);
+      rows.push(["", "", "", "TOTAL OUT (Kes)", "", "", menuTotalOut.toFixed(2), ""]);
+      downloadCSV(kn + "_menu_stock_movement_" + opReportDate + ".csv", toCSV(["Time", "Source", "Item", "Direction", "Qty", "Unit", "Value (Kes)", "Reference"], rows));
     };
 
+    // ── PDF export ───────────────────────────────────────────
+    const kNameForPdf = function () {
+      return (typeof kitchenName !== "undefined" && kitchenName ? kitchenName : "Kitchen");
+    };
+    const newPDFDoc = function (title) {
+      if (typeof window.jspdf === "undefined" || !window.jspdf.jsPDF) {
+        alert("PDF export library failed to load — check your internet connection and try again.");
+        return null;
+      }
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(14);
+      doc.text(kNameForPdf(), 40, 40);
+      doc.setFontSize(11);
+      doc.text(title, 40, 58);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(120);
+      doc.text("Report date: " + opReportDate + "   ·   Generated: " + new Date().toLocaleString("en-KE"), 40, 74);
+      doc.setTextColor(0);
+      return doc;
+    };
+    const savePDF = function (doc, filename) {
+      if (!doc) return;
+      doc.save(filename);
+    };
+    const exportDailyReportPDF = function () {
+      const doc = newPDFDoc("Daily Sales Report (Itemised)");
+      if (!doc) return;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.text("Summary by Menu Item", 40, 96);
+      doc.autoTable({
+        startY: 104,
+        head: [["Menu Item", "Orders", "Qty Sold", "Revenue", "% of Total"]],
+        body: menuSummaryRows.map(r => [r.itemName, r.orders, r.qty, fmtK(r.revenue), grandTotal > 0 ? (r.revenue / grandTotal * 100).toFixed(1) + "%" : "—"]),
+        foot: [["Total", "", grandQty, fmtK(grandTotal), ""]],
+        headStyles: { fillColor: [60, 47, 31] },
+        footStyles: { fillColor: [240, 240, 240], textColor: 20, fontStyle: "bold" },
+        styles: { fontSize: 9, cellPadding: 5 }
+      });
+      const y2 = doc.lastAutoTable.finalY + 20;
+      doc.text("Itemised Orders", 40, y2);
+      doc.autoTable({
+        startY: y2 + 8,
+        head: [["Order #", "Type", "Item", "Qty", "Unit Price", "Line Total", "Payment Method", "Status"]],
+        body: saleRows.map(r => ["#" + r.orderNo, r.type, r.itemName, r.qty, fmtK(r.price), fmtK(r.lineTotal), r.payment, r.status]),
+        foot: [["", "", "", grandQty, "", fmtK(grandTotal), "", ""]],
+        headStyles: { fillColor: [60, 47, 31] },
+        footStyles: { fillColor: [240, 240, 240], textColor: 20, fontStyle: "bold" },
+        styles: { fontSize: 9, cellPadding: 5 }
+      });
+      savePDF(doc, kNameForPdf().replace(/\s+/g, "_") + "_daily_report_" + opReportDate + ".pdf");
+    };
+    const exportInventoryMovementPDF = function () {
+      const doc = newPDFDoc("Inventory Movement Report (Raw Materials)");
+      if (!doc) return;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.text("Stock Balances", 40, 96);
+      doc.autoTable({
+        startY: 104,
+        head: [["Item", "Unit", "Opening Balance", "Total In", "Total Out", "Closing Balance"]],
+        body: invBalanceRows.map(b => [b.name, b.unit, b.opening, b.inQty || "—", b.outQty || "—", b.closing]),
+        headStyles: { fillColor: [60, 47, 31] },
+        styles: { fontSize: 9, cellPadding: 5 }
+      });
+      const y2 = doc.lastAutoTable.finalY + 20;
+      doc.text("Movement Log", 40, y2);
+      doc.autoTable({
+        startY: y2 + 8,
+        head: [["Time", "Source", "Item", "Direction", "Qty", "Unit", "Value (Kes)", "Reference"]],
+        body: moveRows.map(r => [r.time, r.source, r.item, r.direction.toUpperCase(), r.qty, r.unit, fmtK(r.value), r.ref]),
+        foot: [["", "", "", "TOTAL", "", "", "IN " + fmtK(totalIn) + "  /  OUT " + fmtK(totalOut), ""]],
+        headStyles: { fillColor: [60, 47, 31] },
+        footStyles: { fillColor: [240, 240, 240], textColor: 20, fontStyle: "bold" },
+        styles: { fontSize: 9, cellPadding: 5 }
+      });
+      savePDF(doc, kNameForPdf().replace(/\s+/g, "_") + "_inventory_movement_" + opReportDate + ".pdf");
+    };
+    const exportMenuStockMovementPDF = function () {
+      const doc = newPDFDoc("Menu Stock Movement Report");
+      if (!doc) return;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.text("Stock Balances", 40, 96);
+      doc.autoTable({
+        startY: 104,
+        head: [["Menu Item", "Opening Balance", "Total In", "Total Out", "Closing Balance"]],
+        body: menuBalanceRows.map(b => [b.name, b.opening, b.inQty || "—", b.outQty || "—", b.closing]),
+        headStyles: { fillColor: [60, 47, 31] },
+        styles: { fontSize: 9, cellPadding: 5 }
+      });
+      const y2 = doc.lastAutoTable.finalY + 20;
+      doc.text("Movement Log", 40, y2);
+      doc.autoTable({
+        startY: y2 + 8,
+        head: [["Time", "Source", "Item", "Direction", "Qty", "Unit", "Value (Kes)", "Reference"]],
+        body: menuStockRows.map(r => [r.time, r.source, r.item, r.direction.toUpperCase(), r.qty, r.unit, fmtK(r.value), r.ref]),
+        foot: [["", "", "", "TOTAL", "", "", "IN " + fmtK(menuTotalIn) + "  /  OUT " + fmtK(menuTotalOut), ""]],
+        headStyles: { fillColor: [60, 47, 31] },
+        footStyles: { fillColor: [240, 240, 240], textColor: 20, fontStyle: "bold" },
+        styles: { fontSize: 9, cellPadding: 5 }
+      });
+      savePDF(doc, kNameForPdf().replace(/\s+/g, "_") + "_menu_stock_movement_" + opReportDate + ".pdf");
+    };
+
+    const TabBtn = (key, label, icon) => React.createElement("button", {
+      key: key,
+      onClick: () => setOpReportTab(key),
+      style: {
+        background: opReportTab === key ? C.accent : "transparent",
+        color: opReportTab === key ? "#000" : C.text,
+        border: "1px solid " + (opReportTab === key ? C.accent : "#3C2F1F"),
+        borderRadius: 8,
+        padding: "8px 14px",
+        cursor: "pointer",
+        fontSize: 13,
+        fontWeight: 700
+      }
+    }, icon + " " + label);
+
+    const isPastDate = opReportDate !== currentDate;
+
     return React.createElement("div", { style: { maxWidth: 1100, margin: "0 auto", display: "flex", flexDirection: "column", gap: 14 } },
-      React.createElement("div", { style: { display: "flex", justifyContent: "flex-end" } },
-        React.createElement("button", {
-          onClick: exportDailyReport,
-          style: { background: C.accent, border: "none", color: "#000", borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
-        }, "📤 Export CSV")
-      ),
-      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 10 } },
-        [
-          { label: "Today Total", value: fmtK(totalRev), color: C.accent, icon: "💰", sub: todayOrders.length + " orders" },
-          { label: "Dine-In", value: fmtK(dineInRev), color: C.green, icon: "🍽️", sub: dineInToday.length + " orders" },
-          { label: "Delivery", value: fmtK(deliveryRev), color: C.blue, icon: "🛵", sub: deliveryToday.length + " orders" },
-          { label: "Takeout", value: fmtK(takeoutRev), color: C.gold, icon: "📦", sub: takeoutToday.length + " orders" }
-        ].map(stat => React.createElement("div", { key: stat.label, style: cs({ textAlign: "center", padding: 14 }) },
-          React.createElement("div", { style: { fontSize: 20, marginBottom: 4 } }, stat.icon),
-          React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 4 } }, stat.label),
-          React.createElement("div", { style: { fontSize: 18, fontWeight: 800, color: stat.color, marginBottom: 2 } }, stat.value),
-          React.createElement("div", { style: { fontSize: 11, color: C.muted } }, stat.sub)
-        ))
-      ),
-      
-      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 } },
-        // Top Selling Items
-        React.createElement("div", { style: cs({ display: "flex", flexDirection: "column", gap: 8 }) },
-          React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.accent } }, "🍽️ Top Selling Items"),
-          topItems.length === 0 ? React.createElement("div", { style: { color: C.muted, fontSize: 12, textAlign: "center", padding: 20 } }, "No sales yet today") :
-          React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
-            topItems.map((item, idx) => React.createElement("div", { key: idx, style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: 10, background: C.card, borderRadius: 8 } },
-              React.createElement("div", null,
-                React.createElement("div", { style: { fontWeight: 700, fontSize: 13 } }, item.name),
-                React.createElement("div", { style: { fontSize: 11, color: C.muted } }, item.qty + " sold")
-              ),
-              React.createElement("div", { style: { fontWeight: 800, color: C.green, textAlign: "right" } }, fmtK(item.revenue))
-            ))
-          )
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+        React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+          TabBtn("sales", "Daily Sales", "🧾"),
+          TabBtn("inventory", "Inventory Movement", "📦"),
+          TabBtn("menustock", "Menu Stock Movement", "🍽️")
         ),
-        
-        // Payment Breakdown
-        React.createElement("div", { style: cs({ display: "flex", flexDirection: "column", gap: 8 }) },
-          React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.accent } }, "💵 Payment Methods"),
-          React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
-            React.createElement("div", { style: { padding: 12, background: C.card, borderRadius: 8 } },
-              React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 4 } },
-                React.createElement("span", { style: { fontSize: 13 } }, "💵 Cash"),
-                React.createElement("span", { style: { fontWeight: 700, color: C.green } }, fmtK(cashTotal))
-              ),
-              React.createElement("div", { style: { fontSize: 11, color: C.muted } }, cashCount + " transactions")
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+          React.createElement("label", { style: { fontSize: 12, color: C.muted, fontWeight: 700 } }, "📅 Report Date"),
+          React.createElement("input", {
+            type: "date",
+            value: opReportDate,
+            max: currentDate,
+            onChange: e => setOpReportDate(e.target.value || currentDate),
+            style: { background: C.card, border: "1px solid #3C2F1F", color: C.text, borderRadius: 8, padding: "8px 10px", fontSize: 13 }
+          }),
+          opReportDate !== currentDate && React.createElement("button", {
+            onClick: () => setOpReportDate(currentDate),
+            style: { background: "transparent", border: "1px solid #3C2F1F", color: C.muted, borderRadius: 8, padding: "8px 10px", cursor: "pointer", fontSize: 12, fontWeight: 700 }
+          }, "Today")
+        )
+      ),
+
+      isPastDate && React.createElement("div", {
+        style: { fontSize: 12, color: C.gold, background: C.gold + "18", border: "1px solid " + C.gold + "40", borderRadius: 8, padding: "8px 12px" }
+      }, "⚠️ Viewing a past date. Opening/Closing balance columns always reflect current live stock, so they're only accurate for today — use the Movement Log rows for a historical record."),
+
+      opReportTab === "sales" && React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } },
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 16, fontWeight: 800, color: C.accent } }, "🧾 Daily Sales Report"),
+          React.createElement("div", { style: { fontSize: 12, color: C.muted } }, opReportDate + " · " + todayOrders.length + " order" + (todayOrders.length === 1 ? "" : "s") + " · " + fmtK(grandTotal))
+        ),
+        React.createElement("div", { style: { display: "flex", gap: 8 } },
+          React.createElement("button", {
+            onClick: exportDailyReport,
+            style: { background: C.accent, border: "none", color: "#000", borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
+          }, "📤 Export CSV"),
+          React.createElement("button", {
+            onClick: exportDailyReportPDF,
+            style: { background: "transparent", border: "1px solid " + C.accent, color: C.accent, borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
+          }, "📄 Export PDF")
+        )
+      ),
+
+      menuSummaryRows.length > 0 && React.createElement("div", { style: cs({ display: "flex", flexDirection: "column", gap: 8, padding: 0, overflow: "hidden" }) },
+        React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.accent, padding: "12px 14px 0" } }, "Summary by Menu Item"),
+        React.createElement("div", { style: { overflowX: "auto" } },
+          React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 480 } },
+            React.createElement("thead", null,
+              React.createElement("tr", { style: { background: C.card } },
+                React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Menu Item"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Orders"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Qty Sold"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Revenue"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "% of Total")
+              )
             ),
-            React.createElement("div", { style: { padding: 12, background: C.card, borderRadius: 8 } },
-              React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 4 } },
-                React.createElement("span", { style: { fontSize: 13 } }, "💳 Digital"),
-                React.createElement("span", { style: { fontWeight: 700, color: C.blue } }, fmtK(digitalTotal))
-              ),
-              React.createElement("div", { style: { fontSize: 11, color: C.muted } }, digitalCount + " transactions")
-            ),
-            React.createElement("div", { style: { padding: 12, background: "linear-gradient(135deg, " + C.accent + "22, " + C.gold + "22)", border: "1px solid " + C.accent + "44", borderRadius: 8 } },
-              React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } },
-                React.createElement("span", { style: { fontSize: 13, fontWeight: 700 } }, "Ratio"),
-                React.createElement("span", { style: { fontWeight: 700, color: C.accent } }, (cashTotal > 0 ? ((cashTotal / totalRev) * 100).toFixed(0) : 0) + "% cash")
+            React.createElement("tbody", null,
+              menuSummaryRows.map((r, idx) => React.createElement("tr", { key: idx, style: { borderBottom: "1px solid #27180F" } },
+                React.createElement("td", { style: { padding: "8px 10px", fontWeight: 600 } }, r.itemName),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.muted } }, r.orders),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right" } }, r.qty),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", fontWeight: 800, color: C.green } }, fmtK(r.revenue)),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.muted } }, grandTotal > 0 ? ((r.revenue / grandTotal * 100).toFixed(1) + "%") : "—")
+              )),
+              React.createElement("tr", { style: { background: C.card } },
+                React.createElement("td", { style: { padding: "10px", fontWeight: 800 } }, "Total"),
+                React.createElement("td", { style: { padding: "10px" } }, ""),
+                React.createElement("td", { style: { padding: "10px", textAlign: "right", fontWeight: 800 } }, grandQty),
+                React.createElement("td", { style: { padding: "10px", textAlign: "right", fontWeight: 800, color: C.accent } }, fmtK(grandTotal)),
+                React.createElement("td", { style: { padding: "10px" } }, "")
               )
             )
           )
         )
       ),
-      
-      // Orders Performance
-      React.createElement("div", { style: cs({ display: "flex", flexDirection: "column", gap: 8 }) },
-        React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.accent } }, "📊 Orders Performance"),
-        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 8 } },
-          [
-            { label: "Total Orders", value: todayOrders.length, unit: "", color: C.gold, icon: "📋" },
-            { label: "Avg Order Value", value: fmtK(avgOrderValue), unit: "", color: C.green, icon: "💹" },
-            { label: "Total Discount", value: fmtK(totalDiscount), unit: "", color: C.red, icon: "🏷️" },
-            { label: "Orders/Hour", value: (todayOrders.length > 0 ? (todayOrders.length / 8).toFixed(1) : 0), unit: "/hr avg", color: C.blue, icon: "⏱️" }
-          ].map(perf => React.createElement("div", { key: perf.label, style: { padding: 12, background: C.card, borderRadius: 8, display: "flex", flexDirection: "column", gap: 4 } },
-            React.createElement("div", { style: { fontSize: 20 } }, perf.icon),
-            React.createElement("div", { style: { fontSize: 11, color: C.muted } }, perf.label),
-            React.createElement("div", { style: { fontSize: 16, fontWeight: 800, color: perf.color } }, perf.value),
-            perf.unit && React.createElement("div", { style: { fontSize: 10, color: C.muted } }, perf.unit)
-          ))
+
+      saleRows.length === 0 ? React.createElement("div", { style: cs({ color: C.muted, fontSize: 13, textAlign: "center", padding: 30 }) }, "No sales recorded yet today") :
+      React.createElement("div", { style: cs({ padding: 0, overflow: "hidden" }) },
+        React.createElement("div", { style: { overflowX: "auto" } },
+          React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 720 } },
+            React.createElement("thead", null,
+              React.createElement("tr", { style: { background: C.card } },
+                React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Order #"),
+                React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Type"),
+                React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Menu Item"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Qty"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Unit Price"),
+                React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Line Total"),
+                React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Payment Method"),
+                React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Status")
+              )
+            ),
+            React.createElement("tbody", null,
+              saleRows.map((r, idx) => React.createElement("tr", { key: idx, style: { borderBottom: "1px solid #27180F" } },
+                React.createElement("td", { style: { padding: "8px 10px", fontWeight: 700, color: C.gold } }, "#" + r.orderNo),
+                React.createElement("td", { style: { padding: "8px 10px", color: C.muted, textTransform: "capitalize" } }, r.type),
+                React.createElement("td", { style: { padding: "8px 10px", fontWeight: 600 } }, r.itemName),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right" } }, r.qty),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.muted } }, fmtK(r.price)),
+                React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", fontWeight: 800, color: C.green } }, fmtK(r.lineTotal)),
+                React.createElement("td", { style: { padding: "8px 10px" } }, r.payment),
+                React.createElement("td", { style: { padding: "8px 10px" } },
+                  React.createElement("span", {
+                    style: {
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      background: r.unpaid ? C.gold + "22" : C.green + "22",
+                      color: r.unpaid ? C.gold : C.green
+                    }
+                  }, r.status)
+                )
+              )),
+              React.createElement("tr", { style: { background: C.card } },
+                React.createElement("td", { style: { padding: "10px", fontWeight: 800 }, colSpan: 3 }, "Total"),
+                React.createElement("td", { style: { padding: "10px", textAlign: "right", fontWeight: 800 } }, grandQty),
+                React.createElement("td", { style: { padding: "10px" } }, ""),
+                React.createElement("td", { style: { padding: "10px", textAlign: "right", fontWeight: 800, color: C.accent } }, fmtK(grandTotal)),
+                React.createElement("td", { style: { padding: "10px" }, colSpan: 2 }, "")
+              )
+            )
+          )
+        )
+      )
+      ),
+
+      opReportTab === "inventory" && React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } },
+        React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+          React.createElement("div", null,
+            React.createElement("div", { style: { fontSize: 16, fontWeight: 800, color: C.accent } }, "📦 Inventory Movement Report"),
+            React.createElement("div", { style: { fontSize: 12, color: C.muted } }, opReportDate + " · " + moveRows.length + " movement" + (moveRows.length === 1 ? "" : "s") + " · IN " + fmtK(totalIn) + " · OUT " + fmtK(totalOut))
+          ),
+          React.createElement("div", { style: { display: "flex", gap: 8 } },
+            React.createElement("button", {
+              onClick: exportInventoryMovement,
+              style: { background: C.accent, border: "none", color: "#000", borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
+            }, "📤 Export CSV"),
+            React.createElement("button", {
+              onClick: exportInventoryMovementPDF,
+              style: { background: "transparent", border: "1px solid " + C.accent, color: C.accent, borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
+            }, "📄 Export PDF")
+          )
+        ),
+
+        React.createElement("div", { style: cs({ display: "flex", flexDirection: "column", gap: 8, padding: 0, overflow: "hidden" }) },
+          React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.accent, padding: "12px 14px 0" } }, "Stock Balances"),
+          React.createElement("div", { style: { overflowX: "auto" } },
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 620 } },
+              React.createElement("thead", null,
+                React.createElement("tr", { style: { background: C.card } },
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Item"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Opening Balance"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Total In"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Total Out"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Closing Balance")
+                )
+              ),
+              React.createElement("tbody", null,
+                invBalanceRows.map((b, idx) => React.createElement("tr", { key: idx, style: { borderBottom: "1px solid #27180F" } },
+                  React.createElement("td", { style: { padding: "8px 10px", fontWeight: 600 } }, b.name),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.muted } }, b.opening + " " + b.unit),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.green } }, b.inQty > 0 ? ("+" + b.inQty + " " + b.unit) : "—"),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.red } }, b.outQty > 0 ? ("−" + b.outQty + " " + b.unit) : "—"),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", fontWeight: 800, color: C.accent } }, b.closing + " " + b.unit)
+                ))
+              )
+            )
+          )
+        ),
+
+        moveRows.length === 0 ? React.createElement("div", { style: cs({ color: C.muted, fontSize: 13, textAlign: "center", padding: 30 }) }, "No stock movement recorded yet today") :
+        React.createElement("div", { style: cs({ padding: 0, overflow: "hidden" }) },
+          React.createElement("div", { style: { overflowX: "auto" } },
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 760 } },
+              React.createElement("thead", null,
+                React.createElement("tr", { style: { background: C.card } },
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Time"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Source"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Item"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Direction"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Qty"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Value (Kes)"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Reference")
+                )
+              ),
+              React.createElement("tbody", null,
+                moveRows.map((r, idx) => React.createElement("tr", { key: idx, style: { borderBottom: "1px solid #27180F" } },
+                  React.createElement("td", { style: { padding: "8px 10px", color: C.muted } }, r.time),
+                  React.createElement("td", { style: { padding: "8px 10px" } }, r.source),
+                  React.createElement("td", { style: { padding: "8px 10px", fontWeight: 600 } }, r.item),
+                  React.createElement("td", { style: { padding: "8px 10px" } },
+                    React.createElement("span", {
+                      style: {
+                        padding: "2px 8px",
+                        borderRadius: 999,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        background: r.direction === "in" ? C.green + "22" : C.red + "22",
+                        color: r.direction === "in" ? C.green : C.red
+                      }
+                    }, r.direction === "in" ? "▲ IN" : "▼ OUT")
+                  ),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right" } }, r.qty + " " + r.unit),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", fontWeight: 700, color: r.direction === "in" ? C.green : C.red } }, fmtK(r.value)),
+                  React.createElement("td", { style: { padding: "8px 10px", color: C.muted } }, r.ref)
+                )),
+                React.createElement("tr", { style: { background: C.card } },
+                  React.createElement("td", { style: { padding: "10px", fontWeight: 800 }, colSpan: 4 }, "Total IN / OUT"),
+                  React.createElement("td", { style: { padding: "10px" } }, ""),
+                  React.createElement("td", { style: { padding: "10px", textAlign: "right", fontWeight: 800 } },
+                    React.createElement("div", { style: { color: C.green } }, "IN " + fmtK(totalIn)),
+                    React.createElement("div", { style: { color: C.red } }, "OUT " + fmtK(totalOut))
+                  ),
+                  React.createElement("td", { style: { padding: "10px" } }, "")
+                )
+              )
+            )
+          )
+        )
+      ),
+
+      opReportTab === "menustock" && React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } },
+        React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+          React.createElement("div", null,
+            React.createElement("div", { style: { fontSize: 16, fontWeight: 800, color: C.accent } }, "🍽️ Menu Stock Movement Report"),
+            React.createElement("div", { style: { fontSize: 12, color: C.muted } }, opReportDate + " · " + menuStockRows.length + " movement" + (menuStockRows.length === 1 ? "" : "s") + " · IN " + fmtK(menuTotalIn) + " · OUT " + fmtK(menuTotalOut))
+          ),
+          React.createElement("div", { style: { display: "flex", gap: 8 } },
+            React.createElement("button", {
+              onClick: exportMenuStockMovement,
+              style: { background: C.accent, border: "none", color: "#000", borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
+            }, "📤 Export CSV"),
+            React.createElement("button", {
+              onClick: exportMenuStockMovementPDF,
+              style: { background: "transparent", border: "1px solid " + C.accent, color: C.accent, borderRadius: 8, padding: "9px 16px", cursor: "pointer", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }
+            }, "📄 Export PDF")
+          )
+        ),
+
+        React.createElement("div", { style: cs({ display: "flex", flexDirection: "column", gap: 8, padding: 0, overflow: "hidden" }) },
+          React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.accent, padding: "12px 14px 0" } }, "Stock Balances"),
+          React.createElement("div", { style: { overflowX: "auto" } },
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 560 } },
+              React.createElement("thead", null,
+                React.createElement("tr", { style: { background: C.card } },
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Menu Item"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Opening Balance"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Total In"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Total Out"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Closing Balance")
+                )
+              ),
+              React.createElement("tbody", null,
+                menuBalanceRows.map((b, idx) => React.createElement("tr", { key: idx, style: { borderBottom: "1px solid #27180F" } },
+                  React.createElement("td", { style: { padding: "8px 10px", fontWeight: 600 } }, b.name),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.muted } }, b.opening + " portion" + (b.opening === 1 ? "" : "s")),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.green } }, b.inQty > 0 ? ("+" + b.inQty) : "—"),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", color: C.red } }, b.outQty > 0 ? ("−" + b.outQty) : "—"),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", fontWeight: 800, color: C.accent } }, b.closing + " portion" + (b.closing === 1 ? "" : "s"))
+                ))
+              )
+            )
+          )
+        ),
+
+        menuStockRows.length === 0 ? React.createElement("div", { style: cs({ color: C.muted, fontSize: 13, textAlign: "center", padding: 30 }) }, "No menu stock movement recorded yet today") :
+        React.createElement("div", { style: cs({ padding: 0, overflow: "hidden" }) },
+          React.createElement("div", { style: { overflowX: "auto" } },
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 760 } },
+              React.createElement("thead", null,
+                React.createElement("tr", { style: { background: C.card } },
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Time"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Source"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Menu Item"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Direction"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Qty"),
+                  React.createElement("th", { style: { textAlign: "right", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Value (Kes)"),
+                  React.createElement("th", { style: { textAlign: "left", padding: "9px 10px", color: C.muted, fontWeight: 700, borderBottom: "1px solid #3C2F1F" } }, "Reference")
+                )
+              ),
+              React.createElement("tbody", null,
+                menuStockRows.map((r, idx) => React.createElement("tr", { key: idx, style: { borderBottom: "1px solid #27180F" } },
+                  React.createElement("td", { style: { padding: "8px 10px", color: C.muted } }, r.time),
+                  React.createElement("td", { style: { padding: "8px 10px" } }, r.source),
+                  React.createElement("td", { style: { padding: "8px 10px", fontWeight: 600 } }, r.item),
+                  React.createElement("td", { style: { padding: "8px 10px" } },
+                    React.createElement("span", {
+                      style: {
+                        padding: "2px 8px",
+                        borderRadius: 999,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        background: r.direction === "in" ? C.green + "22" : C.red + "22",
+                        color: r.direction === "in" ? C.green : C.red
+                      }
+                    }, r.direction === "in" ? "▲ IN" : "▼ OUT")
+                  ),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right" } }, r.qty + " " + r.unit),
+                  React.createElement("td", { style: { padding: "8px 10px", textAlign: "right", fontWeight: 700, color: r.direction === "in" ? C.green : C.red } }, fmtK(r.value)),
+                  React.createElement("td", { style: { padding: "8px 10px", color: C.muted } }, r.ref)
+                )),
+                React.createElement("tr", { style: { background: C.card } },
+                  React.createElement("td", { style: { padding: "10px", fontWeight: 800 }, colSpan: 4 }, "Total IN / OUT"),
+                  React.createElement("td", { style: { padding: "10px" } }, ""),
+                  React.createElement("td", { style: { padding: "10px", textAlign: "right", fontWeight: 800 } },
+                    React.createElement("div", { style: { color: C.green } }, "IN " + fmtK(menuTotalIn)),
+                    React.createElement("div", { style: { color: C.red } }, "OUT " + fmtK(menuTotalOut))
+                  ),
+                  React.createElement("td", { style: { padding: "10px" } }, "")
+                )
+              )
+            )
+          )
         )
       )
     );
@@ -21673,10 +22705,10 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("span", null, "Type"), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: orderType === "dine-in" ? C.green : C.blue,
+      color: otMeta(orderType).color,
       fontWeight: 600
     }
-  }, orderType === "dine-in" ? "🍽️ Dine-In" : "🛵 Delivery", custNote ? " · " + custNote : "")), /*#__PURE__*/React.createElement("div", {
+  }, otMeta(orderType).icon + " " + otMeta(orderType).label, custNote ? " · " + custNote : "")), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
       color: C.muted,
@@ -21688,7 +22720,14 @@ function App() {
     style: {
       color: C.text
     }
-  }, itemCount)), /*#__PURE__*/React.createElement("div", {
+  }, itemCount)), discountAmount > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.gold,
+      display: "flex",
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Discount"), /*#__PURE__*/React.createElement("span", null, "-Kes ", discountAmount.toLocaleString())), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -21708,7 +22747,7 @@ function App() {
       fontWeight: 800,
       color: C.accent
     }
-  }, "Kes ", total.toLocaleString())), /*#__PURE__*/React.createElement("div", {
+  }, "Kes ", finalTotal.toLocaleString())), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -21765,7 +22804,7 @@ function App() {
       color: C.text,
       fontSize: 15
     }
-  }), cashReceived && parseFloat(cashReceived) >= total && /*#__PURE__*/React.createElement("div", {
+  }), cashReceived && parseFloat(cashReceived) >= finalTotal && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 7,
       padding: "7px",
@@ -21776,7 +22815,7 @@ function App() {
       textAlign: "center",
       fontWeight: 700
     }
-  }, "Change: Kes ", (parseFloat(cashReceived) - total).toLocaleString())), payMethod === "mpesa" && /*#__PURE__*/React.createElement("div", {
+  }, "Change: Kes ", (parseFloat(cashReceived) - finalTotal).toLocaleString())), payMethod === "mpesa" && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 11,
       padding: 11,
@@ -21796,7 +22835,7 @@ function App() {
       fontWeight: 700,
       color: C.green
     }
-  }, "Kes ", total.toLocaleString()), /*#__PURE__*/React.createElement("div", {
+  }, "Kes ", finalTotal.toLocaleString()), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.muted,
@@ -21821,7 +22860,7 @@ function App() {
     }
   }, "Cancel"), /*#__PURE__*/React.createElement("button", {
     onClick: checkout,
-    disabled: payMethod === "cash" && (!cashReceived || parseFloat(cashReceived) < total),
+    disabled: payMethod === "cash" && (!cashReceived || parseFloat(cashReceived) < finalTotal),
     style: {
       flex: 2,
       background: payMethod === "tab" ? C.gold : C.green,
@@ -21832,7 +22871,7 @@ function App() {
       cursor: "pointer",
       fontWeight: 700,
       fontSize: 13,
-      opacity: payMethod === "cash" && (!cashReceived || parseFloat(cashReceived) < total) ? 0.4 : 1
+      opacity: payMethod === "cash" && (!cashReceived || parseFloat(cashReceived) < finalTotal) ? 0.4 : 1
     }
   }, payMethod === "tab" ? "📋 Record as Tab" : "✓ Complete Order")))), showDataPanel && /*#__PURE__*/React.createElement("div", {
     style: {
@@ -22323,12 +23362,13 @@ function writeOrdersByDay(ss, orders) {
     dayOrders.forEach(function(o) {
       // Build items string — use lineType per item if available
       var items = (o.items || []).map(function(i) {
-        var tag = i.lineType ? " [" + (i.lineType === "dine-in" ? "DI" : "DEL") + "]" : "";
+        var tag = i.lineType ? " [" + (i.lineType === "dine-in" ? "DI" : i.lineType === "takeaway" ? "TA" : "DEL") + "]" : "";
         return i.name + tag + " x" + i.qty + " @ Kes " + i.price;
       }).join(", ");
 
       var typeLabel = o.type === "mixed"    ? "Mixed"
                     : o.type === "dine-in"  ? "Dine-In"
+                    : o.type === "takeaway" ? "Takeaway"
                     : o.type === "delivery" ? "Delivery" : o.type || "";
       var status    = o.unpaid ? "Open Tab" : "Paid";
       var payment   = o.unpaid ? "Tab" : (o.payment || "");
@@ -22386,7 +23426,7 @@ function writeDailySummary(ss, orders, expenses) {
   var sh = ss.getSheetByName("Daily Summary");
   if (!sh) { sh = ss.insertSheet("Daily Summary"); }
 
-  var headers = ["Date","Total Orders","Revenue (Kes)","Dine-In (Kes)","Delivery (Kes)",
+  var headers = ["Date","Total Orders","Revenue (Kes)","Dine-In (Kes)","Delivery (Kes)","Takeaway (Kes)",
                  "Cash Sales (Kes)","M-Pesa Sales (Kes)","Open Tabs (Kes)",
                  "Total Expenses (Kes)","COGS (Kes)","OpEx (Kes)","Net Profit (Kes)","Last Synced"];
 
@@ -22402,21 +23442,24 @@ function writeDailySummary(ss, orders, expenses) {
   orders.forEach(function(o) {
     if (o.voided) return;
     var d = o.date || "";
-    if (!byDate[d]) byDate[d] = {rev:0, dineIn:0, del:0, count:0, cash:0, mpesa:0, tabs:0};
+    if (!byDate[d]) byDate[d] = {rev:0, dineIn:0, del:0, tk:0, count:0, cash:0, mpesa:0, tabs:0};
     byDate[d].rev   += o.total;
     byDate[d].count += 1;
 
-    // dine-in / delivery split using per-item lineType if mixed order
+    // dine-in / delivery / takeaway split using per-item lineType if mixed order
     if (o.type === "mixed") {
       (o.items || []).forEach(function(i) {
         var lineAmt = i.price * i.qty;
         if (i.lineType === "dine-in")  byDate[d].dineIn += lineAmt;
         if (i.lineType === "delivery") byDate[d].del    += lineAmt;
+        if (i.lineType === "takeaway") byDate[d].tk     += lineAmt;
       });
     } else if (o.type === "dine-in") {
       byDate[d].dineIn += o.total;
     } else if (o.type === "delivery") {
       byDate[d].del += o.total;
+    } else if (o.type === "takeaway") {
+      byDate[d].tk += o.total;
     }
 
     if (!o.unpaid) {
@@ -22456,9 +23499,9 @@ function writeDailySummary(ss, orders, expenses) {
   var unique   = allDates.filter(function(d,i){ return allDates.indexOf(d) === i; }).sort();
 
   unique.forEach(function(d) {
-    var b  = byDate[d]    || {rev:0,dineIn:0,del:0,count:0,cash:0,mpesa:0,tabs:0};
+    var b  = byDate[d]    || {rev:0,dineIn:0,del:0,tk:0,count:0,cash:0,mpesa:0,tabs:0};
     var ex = expByDate[d] || {total:0,cogs:0,opex:0};
-    var row = [d, b.count, b.rev, b.dineIn, b.del,
+    var row = [d, b.count, b.rev, b.dineIn, b.del, b.tk,
                b.cash, b.mpesa, b.tabs,
                ex.total, ex.cogs, ex.opex, b.rev - ex.total, now];
     if (existingRows[d]) {
@@ -22860,9 +23903,9 @@ function autoResizeCols(sh, skipCols) {
       style: {
         fontSize: 9,
         marginLeft: 4,
-        color: i.lineType === "dine-in" ? C.green : C.blue
+        color: otMeta(i.lineType).color
       }
-    }, "(", i.lineType === "dine-in" ? "dine-in" : "delivery", ")")), /*#__PURE__*/React.createElement("span", {
+    }, "(", otMeta(i.lineType).label.toLowerCase(), ")")), /*#__PURE__*/React.createElement("span", {
       style: {
         color: C.gold
       }
@@ -22880,13 +23923,21 @@ function autoResizeCols(sh, skipCols) {
     style: {
       color: C.accent
     }
-  }, "Kes ", receipt.total.toLocaleString()))), /*#__PURE__*/React.createElement("div", {
+  }, "Kes ", receipt.total.toLocaleString())), receipt.discount && receipt.discount > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 10,
+      color: C.gold,
+      marginTop: 4
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Discount"), /*#__PURE__*/React.createElement("span", null, "-Kes ", receipt.discount.toLocaleString()))), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: C.muted,
       marginBottom: 12
     }
-  }, receipt.type === "mixed" ? "🍽️ Dine-In + 🛵 Delivery" : receipt.type === "dine-in" ? "🍽️ Dine-In" : "🛵 Delivery", " \xB7 ", receipt.payment), /*#__PURE__*/React.createElement("button", {
+  }, otMeta(receipt.type).icon + " " + otMeta(receipt.type).label, " \xB7 ", receipt.payment), /*#__PURE__*/React.createElement("button", {
     onClick: () => setReceipt(null),
     style: {
       background: C.accent,
@@ -23699,6 +24750,19 @@ function applySnapshotToLocalStorage(data) {
 
 async function pullSnapshot(uid) {
   try {
+    // Guard against clobbering a fresh local edit with a stale cloud copy.
+    // If local was written more recently than it was last successfully
+    // pushed, the cloud doesn't have the latest change yet (e.g. the page
+    // was refreshed before the beforeunload push finished) — push local up
+    // first instead of overwriting it with what's currently in the cloud.
+    const lastLocalWrite = localStorage.getItem('kk_sync_meta_lastLocalWrite');
+    const lastPushedAt = localStorage.getItem('kk_sync_meta_lastPushedAt');
+    const hasUnsyncedLocalChanges = !!lastLocalWrite && (!lastPushedAt || lastLocalWrite > lastPushedAt);
+    if (hasUnsyncedLocalChanges) {
+      console.log('[Cloud] Unsynced local changes detected on load — pushing before pulling');
+      await pushSnapshot(uid);
+      return;
+    }
     const snap = await getDoc(doc(db, 'hotels', uid, 'appdata', 'snapshot'));
     applySnapshotToLocalStorage(snap.exists() ? (snap.data().data || {}) : {});
   } catch (e) {
@@ -23708,10 +24772,12 @@ async function pullSnapshot(uid) {
 
 async function pushSnapshot(uid) {
   try {
+    const ts = new Date().toISOString();
     await setDoc(doc(db, 'hotels', uid, 'appdata', 'snapshot'), {
       data: collectLocalSnapshot(),
-      updatedAt: new Date().toISOString()
+      updatedAt: ts
     });
+    try { localStorage.setItem('kk_sync_meta_lastPushedAt', ts); } catch (e) {}
     setSyncStatus(true);
   } catch (e) {
     console.error('[Cloud] push failed', e);
